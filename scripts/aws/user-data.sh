@@ -5,14 +5,26 @@
 # Runs once at first boot as root (cloud-init). Everything is logged to
 # /var/log/agentlab-setup.log for tailing over Session Manager or the
 # EC2 serial console — there is no SSH access to this instance by design.
-set -uxo pipefail
+set -euxo pipefail
 exec > >(tee -a /var/log/agentlab-setup.log) 2>&1
 echo "=== agentlab bootstrap starting $(date -u) ==="
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
-apt-get install -y docker.io golang-go git awscli jq python3-yaml
+apt-get install -y docker.io git awscli jq python3-yaml curl
 systemctl enable --now docker
+
+# Ubuntu 22.04's apt-get golang-go is 1.18 — this repo's go.mod requires
+# 1.26.3. Install the real toolchain from upstream instead.
+GO_VERSION=1.26.3
+curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tar.gz
+rm -rf /usr/local/go
+tar -C /usr/local -xzf /tmp/go.tar.gz
+rm /tmp/go.tar.gz
+ln -sf /usr/local/go/bin/go /usr/local/bin/go
+ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt
+echo 'export PATH=$PATH:/usr/local/go/bin' > /etc/profile.d/go.sh
+go version
 
 # Region from IMDSv2 (the instance role has no local AWS config file).
 IMDS_TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" \
@@ -76,8 +88,16 @@ go build -o agentlab .
 echo "Running agentlab configure --defaults (auto-detects the Ollama we just started)..."
 ./agentlab configure --defaults
 
+echo "Running agentlab up (creates the kind cluster, pulls several GiB of platform images)..."
+./agentlab up --trust=false --open=false
+
+# Only now does the kind cluster (and its "kind" docker network) exist, so
+# only now can we read the gateway pods actually use to reach the host
+# (docs/models.md "Local backends on the lab host"). Doing this before `up`
+# would just fall back to a guess.
 echo "Wiring the free local model as an extraModel (platform.extraModels: qwen35-2b)..."
-KIND_GATEWAY=$(docker network inspect kind -f '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || echo "172.21.0.1")
+KIND_GATEWAY=$(docker network inspect kind -f '{{(index .IPAM.Config 0).Gateway}}')
+echo "  kind network gateway: $KIND_GATEWAY"
 python3 - "$KIND_GATEWAY" <<'PYEOF'
 import sys, yaml
 
@@ -101,8 +121,8 @@ with open(path, "w") as f:
     yaml.safe_dump(cfg, f, sort_keys=False)
 PYEOF
 
-echo "Running agentlab up (pulls several GiB of platform images, several minutes)..."
-./agentlab up --trust=false --open=false
+echo "Applying the extraModels change (idempotent — only fills the gap)..."
+./agentlab platform
 
 echo "=== agentlab up finished $(date -u) — running platform-test ==="
 ./agentlab platform-test || echo "platform-test reported issues — check the log above"
