@@ -20,50 +20,55 @@ AMI_ID=$(aws ssm get-parameter \
   --query 'Parameter.Value' --output text)
 echo "  AMI: $AMI_ID"
 
-echo "Finding a VPC to launch into..."
-VPC_ID=$(aws ec2 describe-vpcs --filters Name=is-default,Values=true \
-  --query 'Vpcs[0].VpcId' --output text)
-if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
-  echo "  no default VPC in this account/region — falling back to the first available VPC..."
-  VPC_ID=$(aws ec2 describe-vpcs --query 'Vpcs[0].VpcId' --output text)
-fi
-if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
-  echo "ERROR: no VPC found in this account/region at all. Create one (the AWS console's" >&2
-  echo "'Create default VPC' button under VPC settings is the fastest way) and re-run." >&2
+# Docker/apt/GitHub/Ollama/the platform's images are all on the public
+# internet, not reachable via any AWS PrivateLink endpoint — so whichever
+# subnet we launch into needs a real route out (an Internet Gateway; a NAT
+# Gateway also works). Rather than assume the "default" VPC has one, check
+# every subnet in every VPC and use the first one that actually does.
+echo "Searching every VPC/subnet for one with a route to the internet..."
+SUBNET_ID=""
+VPC_ID=""
+for CANDIDATE_SUBNET in $(aws ec2 describe-subnets --query 'Subnets[].SubnetId' --output text); do
+  CANDIDATE_VPC=$(aws ec2 describe-subnets --subnet-ids "$CANDIDATE_SUBNET" \
+    --query 'Subnets[0].VpcId' --output text)
+  ROUTE_TABLE_ID=$(aws ec2 describe-route-tables \
+    --filters Name=association.subnet-id,Values="$CANDIDATE_SUBNET" \
+    --query 'RouteTables[0].RouteTableId' --output text)
+  if [ -z "$ROUTE_TABLE_ID" ] || [ "$ROUTE_TABLE_ID" = "None" ]; then
+    # No explicit association means the subnet uses its VPC's main route table.
+    ROUTE_TABLE_ID=$(aws ec2 describe-route-tables \
+      --filters Name=vpc-id,Values="$CANDIDATE_VPC" Name=association.main,Values=true \
+      --query 'RouteTables[0].RouteTableId' --output text)
+  fi
+  if [ -z "$ROUTE_TABLE_ID" ] || [ "$ROUTE_TABLE_ID" = "None" ]; then
+    continue
+  fi
+  HAS_ROUTE=$(aws ec2 describe-route-tables --route-table-ids "$ROUTE_TABLE_ID" \
+    --query "RouteTables[0].Routes[?DestinationCidrBlock=='0.0.0.0/0' && (starts_with(GatewayId, 'igw-') || starts_with(NatGatewayId, 'nat-'))].[GatewayId,NatGatewayId]" \
+    --output text)
+  if [ -n "$HAS_ROUTE" ]; then
+    SUBNET_ID="$CANDIDATE_SUBNET"
+    VPC_ID="$CANDIDATE_VPC"
+    echo "  found: $SUBNET_ID in $VPC_ID, route table $ROUTE_TABLE_ID -> $HAS_ROUTE"
+    break
+  fi
+done
+
+if [ -z "$SUBNET_ID" ]; then
+  echo "ERROR: no subnet in any VPC in this account/region has a route to the internet" >&2
+  echo "(no Internet Gateway, no NAT Gateway on any route table). This account/region has no" >&2
+  echo "path out to the internet at all, so this instance could never pull Docker images," >&2
+  echo "clone from GitHub, or register with SSM — this is a network configuration limit, not" >&2
+  echo "something this script can work around. Options:" >&2
+  echo "  - Ask whoever manages this AWS account's networking for a subnet with internet egress" >&2
+  echo "    (an Internet Gateway attached + a 0.0.0.0/0 route, or a NAT Gateway)." >&2
+  echo "  - Run scripts/aws/diagnose-network.sh for the exact current state to hand them." >&2
+  echo "  - Use a different AWS account/region where you can create a default VPC yourself" >&2
+  echo "    (Console: VPC -> Actions -> 'Create default VPC')." >&2
   exit 1
 fi
 echo "  VPC: $VPC_ID"
-
-echo "Finding a subnet in $VPC_ID..."
-SUBNET_ID=$(aws ec2 describe-subnets --filters Name=vpc-id,Values="$VPC_ID" \
-  --query 'Subnets[0].SubnetId' --output text)
-if [ -z "$SUBNET_ID" ] || [ "$SUBNET_ID" = "None" ]; then
-  echo "ERROR: VPC $VPC_ID has no subnets. Pick a different VPC or create a subnet, then re-run." >&2
-  exit 1
-fi
 echo "  Subnet: $SUBNET_ID"
-
-echo "Checking $SUBNET_ID has a route to the internet (needed for apt/Docker/GitHub pulls and for SSM to register)..."
-ROUTE_TABLE_ID=$(aws ec2 describe-route-tables \
-  --filters Name=association.subnet-id,Values="$SUBNET_ID" \
-  --query 'RouteTables[0].RouteTableId' --output text)
-if [ -z "$ROUTE_TABLE_ID" ] || [ "$ROUTE_TABLE_ID" = "None" ]; then
-  # No explicit association means the subnet uses the VPC's main route table.
-  ROUTE_TABLE_ID=$(aws ec2 describe-route-tables \
-    --filters Name=vpc-id,Values="$VPC_ID" Name=association.main,Values=true \
-    --query 'RouteTables[0].RouteTableId' --output text)
-fi
-HAS_IGW_ROUTE=$(aws ec2 describe-route-tables --route-table-ids "$ROUTE_TABLE_ID" \
-  --query "RouteTables[0].Routes[?DestinationCidrBlock=='0.0.0.0/0' && starts_with(GatewayId, 'igw-')].GatewayId" \
-  --output text)
-if [ -z "$HAS_IGW_ROUTE" ]; then
-  echo "ERROR: subnet $SUBNET_ID has no route to an internet gateway (route table $ROUTE_TABLE_ID)." >&2
-  echo "This instance would have no internet access, so it can never register with SSM and the" >&2
-  echo "bootstrap would stall on its first 'apt-get update'. Pick a VPC/subnet that has a route to" >&2
-  echo "an Internet Gateway (any default-VPC subnet normally does), or add one, then re-run." >&2
-  exit 1
-fi
-echo "  route to $HAS_IGW_ROUTE confirmed"
 
 echo "Finding or creating the agentlab-no-inbound security group..."
 SG_ID=$(aws ec2 describe-security-groups \
