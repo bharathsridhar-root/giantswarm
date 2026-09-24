@@ -1,8 +1,7 @@
 #!/bin/bash
 # Launches the agentlab demo EC2 instance: no SSH key, no open inbound
 # ports — reachable only through SSM Session Manager. Run from CloudShell
-# (or any shell with the AWS CLI configured) after scripts/aws/setup-ssm-role.sh
-# and after storing the SSM parameters it printed.
+# (or any shell with the AWS CLI configured) after scripts/aws/setup-ssm-role.sh.
 set -euo pipefail
 
 INSTANCE_TYPE="${INSTANCE_TYPE:-m5.2xlarge}"  # 8 vCPU / 32 GiB — agentlab's 4-CPU/6GiB floor
@@ -21,16 +20,44 @@ AMI_ID=$(aws ssm get-parameter \
   --query 'Parameter.Value' --output text)
 echo "  AMI: $AMI_ID"
 
-echo "Creating a security group with no inbound rules (SSM needs only outbound 443)..."
+echo "Finding a VPC to launch into..."
 VPC_ID=$(aws ec2 describe-vpcs --filters Name=is-default,Values=true \
   --query 'Vpcs[0].VpcId' --output text)
-SG_ID=$(aws ec2 create-security-group \
-  --group-name agentlab-no-inbound \
-  --description "agentlab demo — outbound only, reached via SSM" \
-  --vpc-id "$VPC_ID" --query 'GroupId' --output text 2>/dev/null || \
-  aws ec2 describe-security-groups --filters Name=group-name,Values=agentlab-no-inbound \
-    Name=vpc-id,Values="$VPC_ID" --query 'SecurityGroups[0].GroupId' --output text)
-echo "  Security group: $SG_ID (no ingress rules added — nothing is open to the internet)"
+if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
+  echo "  no default VPC in this account/region — falling back to the first available VPC..."
+  VPC_ID=$(aws ec2 describe-vpcs --query 'Vpcs[0].VpcId' --output text)
+fi
+if [ -z "$VPC_ID" ] || [ "$VPC_ID" = "None" ]; then
+  echo "ERROR: no VPC found in this account/region at all. Create one (the AWS console's" >&2
+  echo "'Create default VPC' button under VPC settings is the fastest way) and re-run." >&2
+  exit 1
+fi
+echo "  VPC: $VPC_ID"
+
+echo "Finding a subnet in $VPC_ID..."
+SUBNET_ID=$(aws ec2 describe-subnets --filters Name=vpc-id,Values="$VPC_ID" \
+  --query 'Subnets[0].SubnetId' --output text)
+if [ -z "$SUBNET_ID" ] || [ "$SUBNET_ID" = "None" ]; then
+  echo "ERROR: VPC $VPC_ID has no subnets. Pick a different VPC or create a subnet, then re-run." >&2
+  exit 1
+fi
+echo "  Subnet: $SUBNET_ID"
+
+echo "Finding or creating the agentlab-no-inbound security group..."
+SG_ID=$(aws ec2 describe-security-groups \
+  --filters Name=group-name,Values=agentlab-no-inbound Name=vpc-id,Values="$VPC_ID" \
+  --query 'SecurityGroups[0].GroupId' --output text)
+if [ -z "$SG_ID" ] || [ "$SG_ID" = "None" ]; then
+  SG_ID=$(aws ec2 create-security-group \
+    --group-name agentlab-no-inbound \
+    --description "agentlab demo — outbound only, reached via SSM" \
+    --vpc-id "$VPC_ID" --query 'GroupId' --output text)
+fi
+if [ -z "$SG_ID" ] || [ "$SG_ID" = "None" ]; then
+  echo "ERROR: could not find or create the security group. See the AWS CLI output above." >&2
+  exit 1
+fi
+echo "  Security group: $SG_ID (no ingress rules — nothing is open to the internet)"
 
 echo "Launching $INSTANCE_TYPE..."
 INSTANCE_ID=$(aws ec2 run-instances \
@@ -38,11 +65,17 @@ INSTANCE_ID=$(aws ec2 run-instances \
   --instance-type "$INSTANCE_TYPE" \
   --iam-instance-profile Name=agentlab-ec2-profile \
   --security-group-ids "$SG_ID" \
+  --subnet-id "$SUBNET_ID" \
   --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":$VOLUME_SIZE,\"VolumeType\":\"gp3\"}}]" \
   --user-data "file://$SCRIPT_DIR/user-data.sh" \
   --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME_TAG}]" \
   --metadata-options "HttpTokens=required" \
   --query 'Instances[0].InstanceId' --output text)
+
+if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
+  echo "ERROR: run-instances did not return an instance id. See the AWS CLI output above." >&2
+  exit 1
+fi
 
 echo
 echo "Instance launched: $INSTANCE_ID"
