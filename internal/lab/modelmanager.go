@@ -1,0 +1,345 @@
+package lab
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/giantswarm/agentlab/internal/config"
+)
+
+// The model-manager component (platform.modelManager in agentlab.yaml): the
+// umbrella's `model-manager` dependency in front of the model servers that
+// run on the lab host — an Ollama (backend ollama), a Lemonade Server
+// (backend lemonade: FastFlowLM on AMD Ryzen AI NPUs, llama.cpp on GPU/CPU),
+// an LM Studio (backend lmstudio: llama.cpp on GPU/CPU, MLX on Apple
+// silicon). One model-manager fronts every backend of
+// platform.modelManager.backends, the first being its default. Pods reach the
+// host only through the kind docker network's gateway — the same address
+// docs/models.md documents for extraModels — so every endpoint is detected
+// from `docker network inspect kind` plus the server's default port rather
+// than asked for. Everything that can go wrong is host-side plumbing (bind
+// address, firewall), which preflightHostServer turns into an early,
+// actionable failure instead of a model-manager pod that reports an unhealthy
+// backend after a ten-minute install.
+//
+// Which server answers is decided by the SHAPE of its answer, never by a
+// status code (backends.go): LM Studio answers HTTP 200 with an
+// {"error": ...} document for every path outside its /api/v1, Ollama's
+// /api/version among them.
+
+// modelManagerMCPServer is the MCPServer CR name the model-manager chart
+// registers with muster (model-manager.muster.mcpServer.name, the chart
+// default); muster prefixes its tools with it: x_model-manager_<tool>.
+const modelManagerMCPServer = "model-manager"
+
+// kindDockerNetwork is the docker network kind creates its nodes on.
+const kindDockerNetwork = "kind"
+
+// probeImage runs the in-cluster reachability probe: busybox wget in the
+// alpine image the umbrella already ships elsewhere (small, present in the
+// host cache after the first run, side-loaded before the probe pod).
+const probeImage = "gsoci.azurecr.io/giantswarm/alpine:3.22.1"
+
+// probePodTimeout bounds the reachability probe: the pod scheduled, its image
+// present (side-loaded first), wget's own per-read timeout inside.
+const probePodTimeout = 120 * time.Second
+
+// Lemonade's own API paths.
+const (
+	lemonadeHealthPath  = "/api/v1/health"
+	lemonadeModelsPath  = "/api/v1/models"
+	lemonadeAPIBasePath = "/api/v1"
+)
+
+// maxProbeBody bounds the identity probe's read: an inventory grows with the
+// host's library, and the whole document has to parse to prove its shape. A
+// document that hits the bound is an error, not a short read — truncated JSON
+// would fail to parse and read as "no such server".
+const maxProbeBody = 8 << 20
+
+// The identity probe's two budgets, which measure different things on
+// purpose.
+//
+// probeTimeout is the whole exchange, and it matches the inventory readers in
+// hostmodels.go: LM Studio's identifying document IS its library, so a
+// machine with a large one needs the same room here. Two seconds silently
+// dropped such a server from the discovery, and ApplyDiscovered then rewrote
+// platform.modelManager.backends without it.
+//
+// probeHeaderTimeout bounds the wait for the answer to START. Without it the
+// whole budget is also the budget for a listener that accepts and never
+// writes — a debugger stub on 1234, say — and `configure` probes the servers
+// one after another, so every such port costs the full timeout. It is also
+// the number the in-cluster preflight's `wget -T` uses, so a server that
+// passes here cannot fail there for a reason this probe tolerated.
+const (
+	probeTimeout       = 10 * time.Second
+	probeHeaderTimeout = 2 * time.Second
+)
+
+// probeClient dials a host model server for the identity probe.
+func probeClient() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = probeHeaderTimeout
+	return &http.Client{Timeout: probeTimeout, Transport: transport}
+}
+
+// detectHostServer asks a model server at base to identify itself — the
+// configure-time question "is there one on this machine at all?" —
+// reachability from pods (bind address, firewall) is preflightHostServer's
+// job at platform time. A 200 is necessary and never sufficient: what the
+// body looks like decides (backends.go).
+func detectHostServer(backend, base string) (ident string, ok bool) {
+	spec, known := backendSpec(backend)
+	if !known {
+		return "", false
+	}
+	resp, err := probeClient().Get(base + spec.probe.path)
+	if err != nil {
+		return "", false
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return "", false
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxProbeBody+1))
+	if err != nil || len(body) > maxProbeBody {
+		return "", false
+	}
+	return spec.probe.ident(body)
+}
+
+// loopbackBaseFn resolves a backend's loopback base; a variable so tests can
+// point the host-side fallback at a stand-in server.
+var loopbackBaseFn = loopbackBase
+
+// loopbackBase is where a server on this machine answers on its default port.
+func loopbackBase(backend string) string {
+	return fmt.Sprintf("http://127.0.0.1:%d", config.BackendPort(backend))
+}
+
+// kindGatewayIP returns the address pods dial to reach services on the host:
+// the IPv4 gateway of the kind docker network. Under rootless podman the
+// bridge gateway is not the host (pasta routes host traffic through
+// host.containers.internal, 169.254.1.2, and nothing answers on the
+// gateway), so there the address is what the node resolves that name to —
+// which needs the node, like the network needs the cluster.
+func kindGatewayIP(node string) (string, error) {
+	if dockerIsPodman() {
+		out, err := outputQuiet("docker", "exec", node, "getent", "hosts", "host.containers.internal")
+		if err != nil {
+			return "", fmt.Errorf("node %q cannot resolve host.containers.internal (the node must be running, and podman writes the name into its /etc/hosts): %w", node, err)
+		}
+		if ip := firstIPv4(out); ip != "" {
+			return ip, nil
+		}
+		return "", fmt.Errorf("node %q resolves host.containers.internal to no IPv4 address", node)
+	}
+	out, err := outputQuiet("docker", "network", "inspect", kindDockerNetwork,
+		"-f", `{{range .IPAM.Config}}{{.Gateway}}{{"\n"}}{{end}}`)
+	if err != nil {
+		return "", fmt.Errorf("docker network %q not found (the kind cluster creates it): %w", kindDockerNetwork, err)
+	}
+	if ip := firstIPv4(out); ip != "" {
+		return ip, nil
+	}
+	return "", fmt.Errorf("docker network %q has no IPv4 gateway", kindDockerNetwork)
+}
+
+// firstIPv4 returns the first IPv4 address leading a line of out.
+func firstIPv4(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		if f := strings.Fields(line); len(f) > 0 {
+			if ip := net.ParseIP(f[0]); ip != nil && ip.To4() != nil {
+				return ip.String()
+			}
+		}
+	}
+	return ""
+}
+
+// resolveBackendEndpoint is the URL model-manager (or an agent pod) dials for
+// a backend: the configured override, else the address pods reach this
+// machine on — the kind gateway, or the container runtime's host alias where
+// that gateway is inside its VM — on the server's default port. The kind
+// network exists once the cluster does, so callers that render before a boot
+// get an error they may tolerate (render) or must not (platform).
+func resolveBackendEndpoint(cfg *config.Config, backend string) (string, error) {
+	if ep := cfg.Platform.ModelManager.EndpointFor(backend); ep != "" {
+		return strings.TrimSuffix(ep, "/"), nil
+	}
+	node := cfg.ControlPlaneNode()
+	gw, err := kindGatewayIP(node)
+	if err != nil {
+		return "", gatewayDetectionErr(backend, err)
+	}
+	return backendEndpointVia(node, backend, gw)
+}
+
+// gatewayDetectionErr is the one failure the caller cannot probe past: with no
+// gateway there is no address to dial, and the override is the way out.
+func gatewayDetectionErr(backend string, err error) error {
+	return fmt.Errorf("autodetecting the %s endpoint: %w (set platform.modelManager.endpoints.%s to skip the detection)",
+		config.BackendServerName(backend), err, backend)
+}
+
+// backendEndpointVia is resolveBackendEndpoint for a caller that holds the
+// gateway already, so a whole backend list costs one `docker network inspect`.
+func backendEndpointVia(node, backend, gw string) (string, error) {
+	port := config.BackendPort(backend)
+	// The same helper the discovery reports from, so the address named there
+	// and the address wired here cannot disagree.
+	host, err := podReachableHost(node, gw, port)
+	switch {
+	case err != nil:
+		// The probe could not run, so there is no verdict: the gateway is the
+		// documented default, and a busy node cannot move the rendered values.
+		return fmt.Sprintf("http://%s:%d", gw, port), nil
+	case host == "":
+		// Both causes get their own remedy: a server that is not running
+		// answers nowhere, and binding is the fix only where the gateway is
+		// this machine — where it is a bridge inside the runtime's VM, no
+		// bind address can make the server answer on it.
+		return "", fmt.Errorf("no address reaches the host %s from pods: neither %s (the container runtime's gateway) nor %s (its host alias) answers — start the server if it is stopped, bind it to every interface if %s is this machine, or set platform.modelManager.endpoints.%s",
+			config.BackendServerName(backend), net.JoinHostPort(gw, strconv.Itoa(port)),
+			net.JoinHostPort(hostAlias(), strconv.Itoa(port)), gw, backend)
+	}
+	return fmt.Sprintf("http://%s:%d", host, port), nil
+}
+
+// resolveBackendEndpoints resolves every configured backend's endpoint.
+//
+// The backends share the node and the gateway but dial a different port each,
+// so one lookup serves the list and the probes run together: a list whose
+// servers are all stopped otherwise pays two node dial timeouts per backend,
+// one after the other.
+func resolveBackendEndpoints(cfg *config.Config) (map[string]string, error) {
+	backends := cfg.Platform.ModelManager.Backends
+	endpoints := make(map[string]string, len(backends))
+	var probe []string
+	for _, b := range backends {
+		if ep := cfg.Platform.ModelManager.EndpointFor(b); ep != "" {
+			endpoints[b] = strings.TrimSuffix(ep, "/")
+			continue
+		}
+		probe = append(probe, b)
+	}
+	if len(probe) == 0 {
+		return endpoints, nil
+	}
+	node := cfg.ControlPlaneNode()
+	gw, err := kindGatewayIP(node)
+	if err != nil {
+		return nil, gatewayDetectionErr(probe[0], err)
+	}
+	resolved := make([]string, len(probe))
+	errs := make([]error, len(probe))
+	var wg sync.WaitGroup
+	for i, b := range probe {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			resolved[i], errs[i] = backendEndpointVia(node, b, gw)
+		}()
+	}
+	wg.Wait()
+	// In the configured order, so the same unreachable list always names the
+	// same backend.
+	for i, b := range probe {
+		if errs[i] != nil {
+			return nil, errs[i]
+		}
+		endpoints[b] = resolved[i]
+	}
+	return endpoints, nil
+}
+
+// preflightHostServer proves a host model server answers from INSIDE the
+// cluster before the platform install waits ten minutes on a model-manager
+// whose backend is unreachable (or wires ModelConfigs to a dead endpoint). A
+// short-lived pod fetches the server's identifying document and the SAME
+// fingerprint the loopback discovery used decides what answered
+// (backends.go), through runProbePod's clean container log — so the three
+// outcomes stay apart: this server answered, something else answered, or
+// nothing did. The last two used to share one message, which diagnosed a
+// wrong-server 200 — normal for LM Studio outside its /api/v1 — as an
+// unreachable host, complete with bind and firewall fixes.
+func preflightHostServer(cfg *config.Config, backend, endpoint string) error {
+	server := config.BackendServerName(backend)
+	spec, known := backendSpec(backend)
+	if !known {
+		return fmt.Errorf("unknown host model server backend %q", backend)
+	}
+	// The probe image goes host cache -> node like every lab image, so the
+	// pod never waits on an in-node pull (best-effort: a miss falls back to
+	// the kubelet's pull under the pod-running timeout).
+	sideloadImages(cfg, hostPullImages([]string{probeImage}))
+	pod := backend + "-preflight"
+	ctx, cancel := context.WithTimeout(context.Background(), probePodTimeout)
+	defer cancel()
+	// -T is wget's per-read budget and matches the loopback probe's header
+	// timeout, so a server that passed there cannot fail here on a wait this
+	// lab already decided to tolerate.
+	out, err := runProbePod(ctx, platformNamespace, pod, probeImage,
+		[]string{"wget", "-qO-", "-T", strconv.Itoa(int(probeHeaderTimeout.Seconds())), endpoint + spec.probe.path},
+		probePodTimeout)
+	if err == nil {
+		if ident, ok := spec.probe.ident([]byte(out)); ok {
+			note("host %s answers from inside the cluster: %s", server, ident)
+			return nil
+		}
+		return fmt.Errorf("something at %s answered the probe, but it is not %s: the document at %s "+
+			"is not this server's.\n"+
+			"  Pods reached the address — this is not a bind or firewall problem — so either\n"+
+			"  platform.modelManager.endpoints.%s points at a different server, or the %s\n"+
+			"  there is older than the API the lab needs.\n"+
+			"  Answer: %.300s",
+			endpoint, server, spec.probe.path, backend, server, strings.TrimSpace(out))
+	}
+	out = strings.TrimSpace(out)
+	reason := "the probe pod could not fetch it"
+	fixes := spec.bindFix + "\n" +
+		"  - allow TCP " + fmt.Sprint(config.BackendPort(backend)) + " from the docker bridge subnets (they fall inside\n" +
+		"    172.16.0.0/12) through the host firewall — pod->host traffic arrives on the\n" +
+		"    bridge like any other inbound connection"
+	switch {
+	case strings.Contains(out, "refused"):
+		reason = fmt.Sprintf("connection refused — %s is not listening on the bridge address (the usual\n  cause: it is bound to 127.0.0.1)", server)
+	case strings.Contains(out, "timed out"), strings.Contains(out, "timeout"):
+		reason = "connection timed out — the host firewall drops pod->host traffic on the docker\n  bridge (the request never reaches the server)"
+	}
+	return fmt.Errorf("host %s is not reachable from pods at %s: %s.\n"+
+		"  Fixes (docs/models.md, \"Local backends on the lab host\"):\n%s\n"+
+		"  Then re-run `agentlab platform`, or drop %s from platform.modelManager.backends\n"+
+		"  (`agentlab configure --defaults` rewrites the list from what answers on this machine).\n"+
+		"  Probe output: %.300s", server, endpoint, reason, fixes, backend, out)
+}
+
+// modelManagerHint is the platform-up summary for managed models: the one
+// model-manager and every host server it fronts, the first being its default
+// backend.
+func modelManagerHint(cfg *config.Config, endpoints map[string]string) string {
+	if !cfg.ModelManagerEnabled() {
+		return "  Model manager is disabled (platform.modelManager in agentlab.yaml)."
+	}
+	backends := cfg.ChartBackends()
+	parts := make([]string, 0, len(backends))
+	for _, b := range backends {
+		if b == config.ModelManagerBackendKServe {
+			parts = append(parts, fmt.Sprintf("%s (the platform's own serving on llm-d, preset %s)", b, servingPresetName))
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s (%s) at %s", b, config.BackendServerName(b), endpoints[b]))
+	}
+	return fmt.Sprintf("  Model manager: one instance fronting %s — default backend %s;\n"+
+		"  REST %s/api/v1 (Dex token required; ?backend= / \"backend\" name a server), MCP tools\n"+
+		"  x_model-manager_* through muster; the portal's Models tab manages the same models.",
+		strings.Join(parts, ", "), backends[0], cfg.ModelManagerBaseURL())
+}

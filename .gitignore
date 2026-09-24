@@ -1,0 +1,28 @@
+certs/
+.token
+kubeconfig.oidc
+.kubeconfig.*
+/agentlab
+/agentlab.yaml
+/state/
+
+# Manual scratch next to the config: timestamped copies of agentlab.yaml taken
+# before `agentlab configure` rewrites it, and saved `kubectl get pods -A`
+# snapshots. Neither is written by the CLI; both have leaked into main once.
+/agentlab.yaml.bak-*
+/watch_*
+
+# Build outputs and CI scratch files, all written next to the sources: the
+# devctl Makefile's agentlab-v<version>-<os>-<arch> and bin-dist/, the
+# architect CI's .ldflags, .platforms and agentlab-<os>-<arch> (six of them,
+# built concurrently). Untracked, any of these flips Go's VCS stamp to
+# vcs.modified=true and the binaries built after it report vX.Y.Z+dirty
+# (pkg/project reads that stamp; kubectl-gs ignores kubectl-gs* for the same
+# reason).
+/agentlab-*
+/bin-dist/
+.ldflags
+.platforms
+
+# graphify knowledge graph (regenerable, rebuilt by the post-commit hook)
+graphify-out/

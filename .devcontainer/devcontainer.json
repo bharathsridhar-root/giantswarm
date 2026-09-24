@@ -1,0 +1,24 @@
+{
+  "name": "agentlab",
+  "image": "mcr.microsoft.com/devcontainers/go:1.26",
+  "hostRequirements": {
+    "cpus": 8,
+    "memory": "16gb"
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "moby": true,
+      "dockerDashComposeVersion": "v2"
+    }
+  },
+  "forwardPorts": [443, 32000],
+  "portsAttributes": {
+    "443": { "label": "agentgateway / Backstage / muster edge" },
+    "32000": { "label": "Dex issuer" }
+  },
+  "postCreateCommand": "go build -o agentlab .",
+  "remoteEnv": {
+    "ANTHROPIC_API_KEY": "${localEnv:ANTHROPIC_API_KEY}",
+    "GITHUB_TOKEN": "${localEnv:GITHUB_TOKEN}"
+  }
+}

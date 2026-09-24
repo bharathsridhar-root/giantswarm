@@ -1,0 +1,109 @@
+# Lab additions to the umbrella's Backstage: catalog entities and an
+# app-config overlay, mounted into the chart's Backstage via the
+# backstage.backstage.extraAppConfig / extraVolumes overrides in
+# agent-platform-values.yaml. Both land in the release namespace because the
+# umbrella deploys Backstage there.
+#
+# Catalog entities. Giant Swarm's sign-in resolver
+# (plugins/auth-backend-module-gs/src/signInResolver.ts) only hits the catalog
+# when Dex reports federated_claims.connector_id of giantswarm-ad or
+# giantswarm-github; this lab's static-password connector reports "local", so
+# the resolver falls through to email.split('@')[0] and needs no catalog
+# entity. These exist so the users and groups render as real things in the UI
+# rather than dangling refs.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agentlab-backstage-catalog
+  namespace: agent-platform
+data:
+  users.yaml: |
+{{- range .AllGroups }}
+    apiVersion: backstage.io/v1alpha1
+    kind: Group
+    metadata:
+      name: {{ . }}
+    spec:
+      type: team
+      children: []
+    ---
+{{- end }}
+{{- range $i, $u := .Users }}
+{{- if $i }}
+    ---
+{{- end }}
+    apiVersion: backstage.io/v1alpha1
+    kind: User
+    metadata:
+      name: {{ $u.Username }}
+    spec:
+      profile:
+        displayName: {{ $u.Name }}
+        email: {{ $u.Email }}
+      memberOf: [{{ join $u.Groups ", " }}]
+{{- end }}
+---
+# App-config overlay on top of the umbrella's own
+# (agent-platform-backstage-app-config): the catalog locations for the files
+# above, an in-memory database — the lab needs no Postgres for Backstage —
+# and the gatewayPort-aware public URL.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agentlab-backstage-app-config
+  namespace: agent-platform
+data:
+  app-config.agentlab.yaml: |
+    # Backstage's public URL. The umbrella's app-config renders these three
+    # without a port; Backstage derives its OAuth redirect_uri from them, and
+    # Dex accepts only the redirect URI registered on the agent-platform
+    # client (dex.yaml.tmpl, also .BackstageBaseURL). Both carry
+    # platform.gatewayPort when it is not 443 (HACKS.md U15).
+    app:
+      baseUrl: {{ .BackstageBaseURL }}
+    backend:
+      baseUrl: {{ .BackstageBaseURL }}
+      cors:
+        origin: {{ .BackstageBaseURL }}
+      database:
+        client: better-sqlite3
+        connection: ':memory:'
+    catalog:
+      locations:
+        - type: file
+          target: /lab-catalog/users.yaml
+          rules:
+            - allow: [User, Group]
+{{- if .GitHubToken }}
+    # The portal's skill discovery (the gs backend's GET /api/gs/agent-skills
+    # reads GitHub through Backstage's integrations) authenticates with the
+    # token the lab put into the pod's environment (extraEnvVarsSecrets in
+    # agent-platform-values.yaml, from the Secret githubtoken.go creates). A
+    # reference Backstage resolves at start-up, never the value.
+    integrations:
+      github:
+        - host: github.com
+          token: ${GITHUB_TOKEN}
+{{- end }}
+{{- if .Platform.Observability }}
+    # The umbrella hardcodes mimirEnabled: false — standalone installations
+    # have no GS observability stack at observability.<baseDomain>. With
+    # platform.observability the lab provides exactly that endpoint
+    # (observability-route.yaml.tmpl: the lab Prometheus's query API behind
+    # the Mimir-shaped /prometheus prefix), so the override turns the
+    # Deployments/Clusters metrics back on. Deep-merged over the umbrella's
+    # app-config (this file is listed after it in extraAppConfig), and the
+    # gs frontend's cluster_id fallback maps every sample to this
+    # installation — right for a single-cluster lab.
+    #
+    # The key is the umbrella's Helm RELEASE name (its app-config registers
+    # gs.installations.<release name>), NOT the cluster name — same trap as
+    # backstagetest.go's `?installation=` parameter. Any other key creates a
+    # SECOND installation without authProvider, which the gs frontend skips
+    # with a console warning while the override silently lands on the wrong
+    # entry.
+    gs:
+      installations:
+        agent-platform:
+          mimirEnabled: true
+{{- end }}

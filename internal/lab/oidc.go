@@ -1,0 +1,230 @@
+package lab
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/giantswarm/agentlab/internal/config"
+)
+
+// labDomain is the platform's public domain, set once at command start
+// (SetDomain from main's config load). The lab's contract is that
+// *.<domain> reaches this host's loopback — the kind port mappings — and
+// public DNS merely agrees (the nip.io wildcard). The lab's own HTTP clients
+// therefore dial loopback directly for those names, so health checks and
+// smoke tests never flake on external DNS resolving a name that was always
+// going to mean 127.0.0.1.
+var labDomain struct {
+	sync.Mutex
+	domain string
+}
+
+// SetDomain registers the platform domain for the loopback dialer.
+func SetDomain(domain string) {
+	labDomain.Lock()
+	defer labDomain.Unlock()
+	labDomain.domain = domain
+}
+
+// dialLabAddr rewrites a *.<domain> (or apex) dial target to loopback.
+func dialLabAddr(addr string) string {
+	labDomain.Lock()
+	domain := labDomain.domain
+	labDomain.Unlock()
+	if domain == "" {
+		return addr
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	if host == domain || strings.HasSuffix(host, "."+domain) {
+		return net.JoinHostPort("127.0.0.1", port)
+	}
+	return addr
+}
+
+// labTLSTransport returns a transport that trusts the lab CA (certs/ca.crt)
+// on top of the system pool, so it can talk to both Dex (lab TLS) and
+// plain-HTTP services, and that dials the platform's public hostnames on
+// loopback (see labDomain). Success is cached per process (the CA never
+// changes within a run, and sharing the transport reuses connections), but
+// errors are not: the TUI probes long before `agentlab up` has minted the CA
+// and must pick it up as soon as the file exists.
+var labTransport struct {
+	sync.Mutex
+	cached *http.Transport
+}
+
+func labTLSTransport() (*http.Transport, error) {
+	labTransport.Lock()
+	defer labTransport.Unlock()
+	if labTransport.cached != nil {
+		return labTransport.cached, nil
+	}
+	pool, err := labCertPool()
+	if err != nil {
+		return nil, err
+	}
+	labTransport.cached = &http.Transport{
+		TLSClientConfig: &tls.Config{RootCAs: pool},
+		DialContext:     dialLab,
+	}
+	return labTransport.cached, nil
+}
+
+// labCertPool is what every client of the lab trusts — HTTP and gRPC alike:
+// the system roots plus the lab CA (certs/ca.crt). Read on every call; the
+// callers cache what they build on it.
+func labCertPool() (*x509.CertPool, error) {
+	caPEM, err := os.ReadFile(caCertPath)
+	if err != nil {
+		return nil, fmt.Errorf("reading lab CA (run `agentlab up` first?): %w", err)
+	}
+	pool, err := x509.SystemCertPool()
+	if err != nil {
+		pool = x509.NewCertPool()
+	}
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("certs/ca.crt contains no usable certificate")
+	}
+	return pool, nil
+}
+
+// dialLab dials a TCP address the lab way: a platform hostname on loopback
+// (dialLabAddr), anything else as given — the DialContext of every lab
+// client, HTTP and gRPC.
+func dialLab(ctx context.Context, network, addr string) (net.Conn, error) {
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	return dialer.DialContext(ctx, network, dialLabAddr(addr))
+}
+
+// labHTTPClient returns a client on the shared lab transport.
+func labHTTPClient(timeout time.Duration) (*http.Client, error) {
+	transport, err := labTLSTransport()
+	if err != nil {
+		return nil, err
+	}
+	return &http.Client{Timeout: timeout, Transport: transport}, nil
+}
+
+// dexToken POSTs a token request (any grant type, in form) to the lab Dex and
+// returns the raw id_token.
+// musterLoginScopes are the scopes the headless proofs request from Dex for a
+// token they present to muster (and that muster forwards downstream): the
+// standard claims plus the cross-client audience the kind apiserver trusts
+// (Dex client `kubernetes`, which lists agent-platform under trustedPeers).
+// muster's own browser login requests that audience through the MCPServer CRs'
+// requiredAudiences and Backstage through components.backstage.extraScopes;
+// a password-grant token must ask for it itself, or the servers' downstream
+// OAuth presents a token the apiserver answers with 401.
+const musterLoginScopes = "openid email groups profile audience:server:client_id:" + config.KubernetesClientID
+
+// musterWriterScopes adds the audience muster's own Kubernetes writes (a
+// workflow created through core_workflow_create, as the caller) require —
+// the one Backstage's sign-in requests too (components.backstage.extraScopes)
+// and the dex-k8s-authenticator client trusts agent-platform to ask for.
+const musterWriterScopes = musterLoginScopes + " audience:server:client_id:dex-k8s-authenticator"
+
+func dexToken(cfg *config.Config, clientID, clientSecret string, form url.Values) (string, error) {
+	client, err := labHTTPClient(30 * time.Second)
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequest(http.MethodPost, cfg.Issuer()+"/token",
+		strings.NewReader(form.Encode()))
+	if err != nil {
+		return "", err
+	}
+	req.SetBasicAuth(clientID, clientSecret)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(resp.Body)
+	var tok struct {
+		IDToken          string `json:"id_token"`
+		Error            string `json:"error"`
+		ErrorDescription string `json:"error_description"`
+	}
+	if err := json.Unmarshal(body, &tok); err != nil || tok.IDToken == "" {
+		msg := strings.TrimSpace(string(body))
+		if tok.Error != "" {
+			msg = tok.Error + ": " + tok.ErrorDescription
+		}
+		return "", fmt.Errorf("%s", msg)
+	}
+	return tok.IDToken, nil
+}
+
+// grantTypePassword is the OAuth2 Resource Owner Password Credentials grant.
+const grantTypePassword = "password"
+
+// passwordParam is the password field name shared by Dex's token endpoint
+// (ROPC form) and its login form.
+const passwordParam = "password"
+
+// passwordGrant performs the OAuth2 Resource Owner Password grant against the
+// lab Dex (enabled by oauth2.passwordConnector: local) and returns the raw
+// id_token. This is what makes headless/CI testing a single HTTP call.
+func passwordGrant(cfg *config.Config, clientID, clientSecret, email, password, scope string) (string, error) {
+	token, err := dexToken(cfg, clientID, clientSecret, url.Values{
+		"grant_type":  {grantTypePassword},
+		"username":    {email},
+		passwordParam: {password},
+		"scope":       {scope},
+	})
+	if err != nil {
+		return "", fmt.Errorf("dex login failed for %s: %w", email, err)
+	}
+	return token, nil
+}
+
+// base64URLDecode decodes base64url with or without padding.
+func base64URLDecode(s string) ([]byte, error) {
+	s = strings.TrimRight(s, "=")
+	return base64.RawURLEncoding.DecodeString(s)
+}
+
+// decodeJWTClaims returns the (unverified) payload of a JWT as a JSON object.
+// Verification is the apiserver's and muster's job; this is display plumbing.
+func decodeJWTClaims(token string) (map[string]any, error) {
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return nil, fmt.Errorf("not a JWT")
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("decoding JWT payload: %w", err)
+	}
+	var claims map[string]any
+	if err := json.Unmarshal(raw, &claims); err != nil {
+		return nil, err
+	}
+	return claims, nil
+}
+
+// httpUp reports whether a URL answers with a 2xx (the curl -sf equivalent).
+func httpUp(client *http.Client, url string) bool {
+	resp, err := client.Get(url)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode >= 200 && resp.StatusCode < 300
+}

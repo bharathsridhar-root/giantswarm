@@ -1,0 +1,215 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dex
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: dex-config
+  namespace: dex
+stringData:
+  config.yaml: |
+    issuer: {{ .Issuer }}
+
+    # CRD-backed storage, so the SIGNING KEYS survive pod rolls. With
+    # `type: memory` every `agentlab reload` (a config edit rolls the pod by
+    # design) rotated the keys and the apiserver rejected all tokens with
+    # "failed to verify id token signature" until its JWKS cache refreshed —
+    # minutes of every login failing right after the edit that prompted the
+    # reload. State still dies with the cluster, so the lab stays throwaway.
+    storage:
+      type: kubernetes
+      config:
+        inCluster: true
+
+    web:
+      https: 0.0.0.0:5556
+      tlsCert: /etc/dex/tls/tls.crt
+      tlsKey: /etc/dex/tls/tls.key
+
+    telemetry:
+      http: 0.0.0.0:5558
+
+    logger:
+      level: debug
+
+    oauth2:
+      skipApprovalScreen: true
+      # Enables the Resource Owner Password grant against the local connector.
+      # This is what makes headless/CI testing a single token request. Lab only.
+      passwordConnector: local
+
+    frontend:
+      issuer: Dex Lab
+
+    # ---------------------------------------------------------------------
+    # The whole point: users that exist ONLY here. No GitHub, no GitLab, no
+    # Google, no Keycloak. `groups` on static passwords requires Dex >= v2.45.0.
+    # Users come from agentlab.yaml (edit with `agentlab configure`, then
+    # `agentlab reload`).
+    # ---------------------------------------------------------------------
+    enablePasswordDB: true
+    staticPasswords:
+{{- range .Users }}
+      - email: "{{ .Email }}"
+        # bcrypt(cost 10) of the password in agentlab.yaml
+        hash: "{{ .PasswordHash }}"
+        username: "{{ .Username }}"
+        name: "{{ .Name }}"
+        preferredUsername: "{{ .Username }}"
+        emailVerified: true
+        userID: "{{ userID .Email }}"
+        groups:
+{{- range .Groups }}
+          - "{{ . }}"
+{{- end }}
+{{- end }}
+
+    staticClients:
+      # `trustedPeers` on client X lists the clients allowed to request *X's*
+      # audience through the cross-client scope `audience:server:client_id:X`.
+      # It reads backwards from the intuition: to let Backstage mint a token the
+      # apiserver accepts, `agent-platform` belongs on the *kubernetes* client
+      # here, not `kubernetes` on the agent-platform client.
+      - id: kubernetes
+        name: Kubernetes
+        secret: {{ .KubernetesClientSecret }}
+        redirectURIs:
+          - http://127.0.0.1:{{ .BrowserCallbackPort }}/callback
+          - http://localhost:{{ .BrowserCallbackPort }}/callback
+        trustedPeers:
+          - agent-platform
+      # The ONE platform client, the chart's global.identity convention:
+      # muster (an OAuth *client* of Dex and an OAuth *server* towards MCP
+      # clients like Claude Code) and Backstage both authenticate with it, so
+      # a Backstage-forwarded token natively carries an audience muster
+      # trusts. The muster redirectURI must equal
+      # <muster.oauth.server.baseUrl>/oauth/callback — the public URL through
+      # the agentgateway edge. The Backstage callback path carries the
+      # provider name the chart's app-config registers (oidc-agent-platform;
+      # auth-backend-module-gs only registers providers with the oidc- prefix).
+      - id: agent-platform
+        name: Agent Platform
+        secret: {{ .AgentPlatformClientSecret }}
+        redirectURIs:
+          - {{ .MusterBaseURL }}/oauth/callback
+          - {{ .BackstageBaseURL }}/api/auth/oidc-agent-platform/handler/frame
+          # muster's OAuth *proxy* callback (its client role): the sign-in
+          # fixture pins Dex as its authorization server with this very
+          # client (oauth-fixture.yaml.tmpl), so a per-server sign-in can
+          # complete headlessly in the lab. Dex matches redirect URIs
+          # exactly, no DNS lookups -- unlike muster's own authorization
+          # server, whose SSRF guards reject every lab hostname.
+          - {{ .MusterBaseURL }}/oauth/proxy/callback
+      # Cross-client audience target. Backstage's GS auth provider requests
+      # the scope audience:server:client_id:dex-k8s-authenticator by default
+      # (components.backstage.extraScopes); Dex only honors that when the
+      # TARGET client lists the requesting client in trustedPeers. This client
+      # exists for that audience only — it never runs a flow itself.
+      - id: dex-k8s-authenticator
+        name: dex-k8s-authenticator audience (lab)
+        secret: {{ .KubernetesClientSecret }}
+        trustedPeers:
+          - agent-platform
+---
+# Kubernetes storage needs its own identity: Dex creates its CRDs on first
+# boot and then CRUDs its resources (keys, auth codes, sessions) through the
+# apiserver.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dex
+  namespace: dex
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: dex
+rules:
+  - apiGroups: ["dex.coreos.com"]
+    resources: ["*"]
+    verbs: ["*"]
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: dex
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: dex
+subjects:
+  - kind: ServiceAccount
+    name: dex
+    namespace: dex
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dex
+  namespace: dex
+  labels: { app: dex }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: dex }
+  template:
+    metadata:
+      labels: { app: dex }
+      annotations:
+        # Roll the pod whenever the config or served cert changes (stamped by
+        # `agentlab reload` / `agentlab up` over this manifest + certs/tls.crt).
+        checksum/config: "REPLACED_AT_APPLY"
+    spec:
+      serviceAccountName: dex
+      containers:
+        - name: dex
+          image: {{ .DexImage }}
+          args: ["dex", "serve", "/etc/dex/cfg/config.yaml"]
+          ports:
+            - { name: https, containerPort: 5556 }
+            - { name: telemetry, containerPort: 5558 }
+          volumeMounts:
+            - { name: config, mountPath: /etc/dex/cfg, readOnly: true }
+            - { name: tls, mountPath: /etc/dex/tls, readOnly: true }
+            # Dex expands its config through a temp file, so /tmp must be
+            # writable even with a read-only root filesystem.
+            - { name: tmp, mountPath: /tmp }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 5558 }
+            initialDelaySeconds: 2
+            periodSeconds: 3
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 128Mi }
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: config
+          secret: { secretName: dex-config }
+        - name: tls
+          secret: { secretName: dex-tls }
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dex
+  namespace: dex
+spec:
+  type: NodePort
+  selector: { app: dex }
+  ports:
+    - name: https
+      port: 5556
+      targetPort: 5556
+      nodePort: {{ .DexPort }}

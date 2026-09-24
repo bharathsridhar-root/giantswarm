@@ -1,0 +1,118 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: {{ .ClusterName }}
+# Substrate (kagent's actor runtime) projects pod identities and trust
+# bundles into its ateom workers: the PodCertificateRequest API behind
+# certificates.k8s.io/v1beta1 plus ClusterTrustBundle projection. Without
+# these its WorkerPools cannot start a single pod. Feature gates are fixed
+# at `kind create`, so they are always on — turning them on later means
+# `agentlab down && agentlab up`.
+featureGates:
+  ClusterTrustBundle: true
+  ClusterTrustBundleProjection: true
+  PodCertificateRequest: true
+runtimeConfig:
+  "certificates.k8s.io/v1beta1": "true"
+# The node image's containerd leaves the CRI registry config_path empty, so a
+# hosts.toml under /etc/containerd/certs.d would be ignored — and that
+# directory is how a node learns that localhost:5001 is the kind-registry
+# container, the registry Substrate resolves actor images through.
+containerdConfigPatches:
+  - |-
+    [plugins."io.containerd.grpc.v1.cri".registry]
+      config_path = "/etc/containerd/certs.d"
+nodes:
+  - role: control-plane
+    # Every mapping binds 127.0.0.1 explicitly. kind defaults listenAddress to
+    # 0.0.0.0, which would publish Dex, Backstage and the MCP gateway to the
+    # whole local network — pointless here, since every consumer (browser,
+    # kubectl, Claude Code) runs on this machine and every redirect URI in the
+    # lab is spelled `localhost`.
+    #
+    # These mappings exist ONLY for the host. Nothing inside the cluster uses
+    # them: the apiserver, Backstage and muster all reach Dex through the node's
+    # own localhost:{{ .DexPort }}, which hits the NodePort directly.
+    #
+    # They are fixed when the node container is created, so changing one means
+    # `agentlab down && agentlab up` — you cannot map a new port on a running
+    # cluster. All four are always mapped, so the platform, agents and
+    # Backstage can be enabled later without recreating the cluster.
+    extraPortMappings:
+      # Dex's NodePort. The lynchpin: the browser on the host and the apiserver
+      # inside the node both resolve {{ .Issuer }} to Dex, so the
+      # issuer URL is identical on both sides.
+      - containerPort: {{ .DexPort }}
+        hostPort: {{ .DexPort }}
+        listenAddress: "127.0.0.1"
+        protocol: TCP
+      # Backstage, hostNetwork so it reaches the issuer the same way.
+      - containerPort: {{ .Backstage.Port }}
+        hostPort: {{ .Backstage.Port }}
+        listenAddress: "127.0.0.1"
+        protocol: TCP
+      # muster (agent platform), hostNetwork for the same reason. The node-side
+      # port is the muster chart's default listen port; the host side is what
+      # lets Claude Code dial {{ .MusterBaseURL }}/mcp directly, no port-forward.
+      - containerPort: {{ .MusterNodePort }}
+        hostPort: {{ .Platform.MusterPort }}
+        listenAddress: "127.0.0.1"
+        protocol: TCP
+      # The kagent UI. No issuer trick needed here (the lab UI does no OAuth),
+      # so it stays a plain NodePort Service — pinned to this node port by the
+      # kagent component's postRenderers patch, published as {{ .KagentUIBaseURL }}.
+      - containerPort: {{ .KagentUINodePort }}
+        hostPort: {{ .Platform.AgentsPort }}
+        listenAddress: "127.0.0.1"
+        protocol: TCP
+      # The agentgateway edge: the chart-owned Gateway's HTTPS listener,
+      # published by the lab's pinned NodePort Service (the controller-created
+      # data-plane Service gets a random NodePort). *.{{ .Platform.Domain }}
+      # resolves to 127.0.0.1 on the host, so https://muster.{{ .Platform.Domain }}
+      # and friends land here.
+      - containerPort: {{ .GatewayNodePort }}
+        hostPort: {{ .Platform.GatewayPort }}
+        listenAddress: "127.0.0.1"
+        protocol: TCP
+    # kubeadm already bind-mounts /etc/kubernetes/pki into the apiserver static
+    # pod, so dropping the Dex CA in a subdirectory makes it visible there.
+    extraMounts:
+      - hostPath: {{ .CertsDir }}
+        containerPath: /etc/kubernetes/pki/dex
+        readOnly: true
+kubeadmConfigPatches:
+  # kubelet serializes image pulls by default, so a cold boot queues the
+  # platform's images behind each other (the queue wait dwarfs the pulls
+  # themselves). The lab pulls from three registries on localhost bandwidth —
+  # parallel is strictly better here.
+  - |
+    apiVersion: kubelet.config.k8s.io/v1beta1
+    kind: KubeletConfiguration
+    serializeImagePulls: false
+  # kind matches a kubeadmConfigPatch by its apiVersion+kind and silently
+  # ignores the rest, so this patch has to be in the kubeadm generation the
+  # embedded kind emits — kind is a pinned Go dependency (go.mod), and its
+  # release decides both the node image and the kubeadm config it renders.
+  # kind v0.33 (Kubernetes 1.37) emits kubeadm.k8s.io/v1beta4, where
+  # extraArgs is a LIST of name/value pairs. A kind bump that moves kubeadm to
+  # a new generation is where this is re-checked: on a mismatch the OIDC flags
+  # vanish silently and every token is rejected — verify on a fresh node with
+  #   docker exec <cluster>-control-plane grep oidc /etc/kubernetes/manifests/kube-apiserver.yaml
+  - |
+    apiVersion: kubeadm.k8s.io/v1beta4
+    kind: ClusterConfiguration
+    apiServer:
+      extraArgs:
+        - name: oidc-issuer-url
+          value: {{ .Issuer }}
+        - name: oidc-client-id
+          value: kubernetes
+        - name: oidc-ca-file
+          value: /etc/kubernetes/pki/dex/ca.crt
+        - name: oidc-username-claim
+          value: email
+        - name: oidc-username-prefix
+          value: "oidc:"
+        - name: oidc-groups-claim
+          value: groups
+        - name: oidc-groups-prefix
+          value: "oidc:"

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "musterkind": {
+      "type": "http",
+      "url": "https://muster.127.0.0.1.nip.io/mcp"
+    }
+  }
+}

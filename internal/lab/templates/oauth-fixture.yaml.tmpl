@@ -1,0 +1,95 @@
+# A test fixture, not a real integration. Every downstream the lab aggregates
+# (mcp-kubernetes, mcp-prometheus, model-manager) authenticates the user
+# through the Dex id_token muster forwards (auth.forwardToken), so nothing
+# would otherwise exercise muster's OAuth *client* role — the proxy behind
+# core_auth_login and the portal's per-server "Sign in" button. This MCPServer declares `auth.type: oauth` and stays
+# "Auth Required" forever: every core_auth_login against it answers a fresh
+# challenge (a /oauth/proxy/start URL with its own state), which is what
+# `agentlab platform-test` and `agentlab backstage-test` prove.
+#
+# The target is muster's OWN protected /mcp endpoint (its in-cluster Service).
+# It answers 401 with RFC 9728 resource metadata pointing at muster's own
+# OAuth 2.1 server, so the challenge chain is the real one — proxy start ->
+# muster /oauth/authorize -> Dex — and the authorization server accepts
+# muster's CIMD client id, which a Dex-protected stub could not (Dex knows
+# only static clients). A dedicated OAuth-protected stub server would cost a
+# workload plus an authorization server that knows muster, for the same 401.
+# What self-aggregation costs: right after a muster restart the CR reads
+# Failed (muster dials itself before its own listener is up) until the
+# reconnect backoff flips it to Auth Required, about a minute — `agentlab
+# platform` waits for that — and
+# a completed sign-in connects muster to itself, surfacing its own tools
+# under x_{{ .OAuthFixtureServer }}_. Harmless and per session; the fixture
+# exists to be signed in TO, not to be used.
+apiVersion: muster.giantswarm.io/v1alpha1
+kind: MCPServer
+metadata:
+  name: {{ .OAuthFixtureServer }}
+  namespace: agent-platform
+  labels:
+    app.kubernetes.io/managed-by: agentlab
+    agentlab.giantswarm.io/fixture: oauth-sign-in
+  annotations:
+    agentlab.giantswarm.io/purpose: >-
+      Lab test fixture for the per-server OAuth sign-in path: points muster at
+      its own OAuth-protected /mcp endpoint so this server stays "Auth
+      Required" and every core_auth_login yields a fresh challenge. Proven by
+      `agentlab platform-test` and `agentlab backstage-test`. Not a real
+      integration; signing in connects muster to itself (harmless).
+spec:
+  description: >-
+    Lab fixture: an OAuth-protected MCP server that stays Auth Required, for
+    testing the per-server Sign in flow. Not a real integration.
+  type: streamable-http
+  url: {{ .OAuthFixtureURL }}
+  autoStart: true
+  auth:
+    type: oauth
+    forwardToken: false
+    # The authorization server muster signs the user in to, pinned (the
+    # GitHub-App shape of spec.auth.authorizationServer): the lab Dex's
+    # endpoints, with the platform client registered out of band -- Dex lists
+    # muster's proxy callback on it (dex.yaml.tmpl). Without the pin muster
+    # would discover the endpoint's own authorization server (muster itself)
+    # and identify with its Client ID Metadata Document; that server's SSRF
+    # guards refuse every lab hostname (they resolve to the edge's cluster IP
+    # in-cluster, to loopback outside) for the metadata URL and for a
+    # registered redirect URI alike, so no sign-in could ever complete. Dex
+    # matches redirect URIs exactly, and the token it issues carries the
+    # platform client's audience, which the endpoint trusts -- so the sign-in
+    # completes and the fixture connects, as `agentlab toolsets-test` proves.
+    #
+    # The issuer is the authorization server the sign-in runs against and the
+    # key the grant is filed under; since muster 5.12.1 (muster#1174) it may
+    # differ from the one the endpoint's RFC 9728 metadata names, and it may
+    # be muster's own IdP. This fixture keeps muster's public URL as the
+    # issuer with Dex's endpoints (the GitHub shape) on purpose: a grant
+    # under Dex's issuer would share muster's own login issuer, and
+    # core_auth_logout leaves grants of a shared issuer in place -- the next
+    # run's sign-in would then reconnect without a challenge and the
+    # per-server sign-in proof would have nothing to complete.
+    authorizationServer:
+      issuer: {{ .MusterBaseURL }}
+      authorizationEndpoint: {{ .Issuer }}/auth
+      tokenEndpoint: {{ .Issuer }}/token
+      clientCredentialsSecretRef:
+        name: {{ .OAuthFixtureServer }}-client
+      # A pinned authorization server gets no default scope; Dex refuses a
+      # request without openid (invalid_scope), and offline_access is what
+      # lets muster refresh the grant.
+      scopes: openid profile email offline_access
+---
+# The client the pin above names: the lab's platform client, the one Dex
+# registration that carries muster's proxy callback.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .OAuthFixtureServer }}-client
+  namespace: agent-platform
+  labels:
+    app.kubernetes.io/managed-by: agentlab
+    agentlab.giantswarm.io/fixture: oauth-sign-in
+type: Opaque
+stringData:
+  client-id: {{ .AgentPlatformClientID }}
+  client-secret: {{ .AgentPlatformClientSecret }}
