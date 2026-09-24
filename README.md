@@ -134,6 +134,8 @@ machine, is in [Getting started](docs/getting-started.md).
 | Page | What it covers |
 |---|---|
 | [Getting started](docs/getting-started.md) | Requirements, docker CPU and memory, install, what `configure` discovers, the first `up`, connecting Claude Code |
+| [Running on EC2 without SSH](scripts/aws/README.md) | No local Docker/kind: an unattended EC2 bootstrap over SSM Session Manager (no SSH, no inbound ports), reaching the portal from your laptop |
+| [Smart factory agent demo](factory/README.md) | A starter three-agent (supervisor / machine-monitor / maintenance-dispatcher) demo built on top of the lab's agent platform |
 | [Command reference](docs/cli.md) | Every `agentlab` command and flag, the environment variables, keeping the binary current |
 | [TLS](docs/tls.md) | The lab CA, `trust` and `untrust`, Node and browsers, bringing your own certificate |
 | [The agent platform](docs/platform.md) | muster + mcp-kubernetes: the request path, per-server sign-in, the fake fleet, toolsets, deviations from a real management cluster, the dev channel (a branch's dev builds), Agent Substrate and the platform Postgres from the chart |
