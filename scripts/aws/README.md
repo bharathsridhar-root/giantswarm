@@ -5,9 +5,18 @@ here uses **AWS Systems Manager Session Manager** instead: the instance
 opens no inbound ports at all (outbound HTTPS only, to the SSM service),
 and you get a shell either from the EC2 console's browser-based "Connect"
 button or the AWS CLI — no key pair, no security-group hole. The whole
-lab install is also unattended: `user-data.sh` runs at first boot and does
-`configure --defaults` + `up` for you, so there is nothing to type once the
-instance is launched other than to watch the log.
+lab install is also unattended and **entirely free by default**:
+`user-data.sh` runs at first boot, installs [Ollama](https://ollama.com)
+and pulls a small free model (`qwen3.5:2b`, ~2.7 GB, CPU-only, proven
+tool-calling-capable in `docs/models.md`), wires it as a kagent
+`ModelConfig` named `qwen35-2b`, then runs `configure --defaults` + `up`.
+No Anthropic API key, no credit card, nothing but EC2's own hourly cost.
+There is nothing to type once the instance is launched other than to watch
+the log.
+
+If you'd rather use real Claude models (better answers, still costs
+per-call on top of EC2), that's still supported — see "Using Claude
+instead of the free model" below. It's opt-in, not required.
 
 ## One-time setup (run in AWS CloudShell, or any shell with AWS CLI + IAM permissions)
 
@@ -19,16 +28,8 @@ chmod +x *.sh
 
 This creates an IAM role (`agentlab-ec2-role`) with `AmazonSSMManagedInstanceCore`
 (what makes Session Manager work) plus read access to a `/agentlab/*` SSM
-parameter path, and an instance profile the launch script attaches.
-
-Then store your Anthropic key (required) and GitHub token (optional, lifts
-a rate limit) as SecureString parameters — the instance decrypts them at
-boot, they're never in plaintext user-data or the EC2 console:
-
-```bash
-aws ssm put-parameter --name /agentlab/anthropic-api-key --type SecureString --value 'sk-ant-...' --overwrite
-aws ssm put-parameter --name /agentlab/github-token       --type SecureString --value 'github_pat_...' --overwrite   # optional
-```
+parameter path, and an instance profile the launch script attaches. **No
+SSM parameters are required for the free path** — skip straight to Launch.
 
 ## Launch
 
@@ -36,9 +37,16 @@ aws ssm put-parameter --name /agentlab/github-token       --type SecureString --
 ./launch-instance.sh
 ```
 
-Boots an `m5.xlarge` (4 vCPU/16 GiB — agentlab's floor) Ubuntu 22.04 box,
-no SSH key, no open inbound ports, with `user-data.sh` attached. It prints
-the instance ID and the command to watch progress.
+Boots an `m5.2xlarge` (8 vCPU/32 GiB) Ubuntu 22.04 box, no SSH key, no open
+inbound ports, with `user-data.sh` attached. The extra headroom over
+agentlab's bare 4-CPU/6GiB floor is for Ollama running alongside the
+platform — set `INSTANCE_TYPE=m5.xlarge` before running the script if
+you're using a real Anthropic key instead and skipping the local model
+(see below). It prints the instance ID and the command to watch progress.
+
+**EC2 cost**: `m5.2xlarge` is about $0.38/hr on-demand (`m5.xlarge` about
+$0.19/hr) — this is the only real charge on the free path. Stop or
+terminate the instance when you're not using it (see Tearing down).
 
 ## Watching the bootstrap
 
@@ -116,10 +124,34 @@ export NODE_EXTRA_CA_CERTS=/path/to/ca.crt   # or skip and use http://localhost:
 claude mcp add --transport http muster https://muster.127.0.0.1.nip.io/mcp
 ```
 
-## Re-running with a key added after boot
+## Using the free model
 
-If you launched before setting `/agentlab/anthropic-api-key`, set it, then
-from a Session Manager shell:
+Once the platform's up, create agents (Backstage's create-agent wizard, or
+the `factory/` starter agents) with model **`qwen35-2b`** — that's the
+`ModelConfig` `user-data.sh` wired from the Ollama running on the instance
+itself. `factory/agents/*.yaml` already point at it. It's a 2B-parameter
+model: fine for simple tool calls and short answers, not GPT-4-class
+reasoning — see `docs/models.md` "Agent proofs without an Anthropic key"
+for what it's good at and its known misses.
+
+To check it's actually running: from a Session Manager shell,
+`curl http://localhost:11434/api/tags` should list `qwen3.5:2b`.
+
+## Using Claude instead of the free model (optional, has a real cost)
+
+Store a key **before** launching (the instance only reads it once, at
+boot):
+```bash
+aws ssm put-parameter --name /agentlab/anthropic-api-key --type SecureString --value 'sk-ant-...' --overwrite
+aws ssm put-parameter --name /agentlab/github-token       --type SecureString --value 'github_pat_...' --overwrite   # optional, lifts a GitHub rate limit
+```
+`user-data.sh` picks it up automatically and wires the chart's default
+Anthropic `ModelConfig` alongside the free one — use `modelConfig: default`
+in an agent instead of `qwen35-2b` to use it. Set a spending limit on the
+key in the Anthropic Console first; each agent turn is a billed API call.
+
+If you launched before setting the key, add it after the fact from a
+Session Manager shell:
 ```bash
 sudo -i
 cd /opt/agentlab

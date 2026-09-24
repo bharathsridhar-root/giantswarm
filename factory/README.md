@@ -9,6 +9,13 @@ skill commits. The files in `agents/` are the **values** you hand to that
 call, in the shape `x_agent-manager_create_agent` (or Backstage's wizard)
 expects: `name`, `description`, `systemPrompt`, `toolset`, `modelConfig`.
 
+All three point `modelConfig` at `qwen35-2b` — a free, local, CPU-only
+Ollama model, not Claude. If you ran the EC2 setup in `scripts/aws/`
+without an Anthropic key (the default there), that ModelConfig already
+exists once `agentlab up` finishes. If you have an Anthropic key wired
+instead, change `modelConfig` to `default` in each YAML for better answers
+(at a real per-call cost).
+
 ## The three agents
 
 - **supervisor** (`agents/supervisor.yaml`) — the entry point. Talks to a

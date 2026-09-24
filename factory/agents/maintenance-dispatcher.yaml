@@ -14,7 +14,7 @@ systemPrompt: |
   read-only (it registers no writers), so nothing is persisted yet. See
   factory/README.md "Persisting work orders" for how to wire real writes
   once you're past the first pass.
-modelConfig: default
+modelConfig: qwen35-2b  # free local Ollama model (docs/models.md); swap to `default` if you added an Anthropic key
 toolset:
   - server: mcp-kubernetes
     tools: ["preset:read-only"]

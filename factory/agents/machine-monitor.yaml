@@ -10,7 +10,7 @@ systemPrompt: |
   > 2x baseline, throughput dropped > 30% over 10m) and report which
   machine, which metric, and the observed value. Be precise about numbers;
   do not speculate about root cause, just report symptoms.
-modelConfig: default
+modelConfig: qwen35-2b  # free local Ollama model (docs/models.md); swap to `default` if you added an Anthropic key
 toolset:
   - server: mcp-prometheus
     tools: ["*"]

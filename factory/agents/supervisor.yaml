@@ -10,6 +10,6 @@ systemPrompt: |
   to. When machine-monitor reports an anomaly, confirm the details with it,
   then hand off to maintenance-dispatcher with a clear description of the
   problem and affected machine. Keep responses concise and status-oriented.
-modelConfig: default
+modelConfig: qwen35-2b  # free local Ollama model (docs/models.md); swap to `default` if you added an Anthropic key
 toolset:
   - preset:none

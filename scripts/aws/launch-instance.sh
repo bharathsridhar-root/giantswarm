@@ -5,7 +5,11 @@
 # and after storing the SSM parameters it printed.
 set -euo pipefail
 
-INSTANCE_TYPE="${INSTANCE_TYPE:-m5.xlarge}"   # 4 vCPU / 16 GiB — meets agentlab's floor
+INSTANCE_TYPE="${INSTANCE_TYPE:-m5.2xlarge}"  # 8 vCPU / 32 GiB — agentlab's 4-CPU/6GiB floor
+                                               # plus headroom for Ollama running the free model
+                                               # alongside it (see user-data.sh). m5.xlarge (4/16)
+                                               # works if you skip the free model and bring your
+                                               # own Anthropic key instead.
 VOLUME_SIZE="${VOLUME_SIZE:-30}"              # GiB; default 8GiB root disk is too small
 NAME_TAG="${NAME_TAG:-agentlab-demo}"
 
