@@ -43,6 +43,28 @@ if [ -z "$SUBNET_ID" ] || [ "$SUBNET_ID" = "None" ]; then
 fi
 echo "  Subnet: $SUBNET_ID"
 
+echo "Checking $SUBNET_ID has a route to the internet (needed for apt/Docker/GitHub pulls and for SSM to register)..."
+ROUTE_TABLE_ID=$(aws ec2 describe-route-tables \
+  --filters Name=association.subnet-id,Values="$SUBNET_ID" \
+  --query 'RouteTables[0].RouteTableId' --output text)
+if [ -z "$ROUTE_TABLE_ID" ] || [ "$ROUTE_TABLE_ID" = "None" ]; then
+  # No explicit association means the subnet uses the VPC's main route table.
+  ROUTE_TABLE_ID=$(aws ec2 describe-route-tables \
+    --filters Name=vpc-id,Values="$VPC_ID" Name=association.main,Values=true \
+    --query 'RouteTables[0].RouteTableId' --output text)
+fi
+HAS_IGW_ROUTE=$(aws ec2 describe-route-tables --route-table-ids "$ROUTE_TABLE_ID" \
+  --query "RouteTables[0].Routes[?DestinationCidrBlock=='0.0.0.0/0' && starts_with(GatewayId, 'igw-')].GatewayId" \
+  --output text)
+if [ -z "$HAS_IGW_ROUTE" ]; then
+  echo "ERROR: subnet $SUBNET_ID has no route to an internet gateway (route table $ROUTE_TABLE_ID)." >&2
+  echo "This instance would have no internet access, so it can never register with SSM and the" >&2
+  echo "bootstrap would stall on its first 'apt-get update'. Pick a VPC/subnet that has a route to" >&2
+  echo "an Internet Gateway (any default-VPC subnet normally does), or add one, then re-run." >&2
+  exit 1
+fi
+echo "  route to $HAS_IGW_ROUTE confirmed"
+
 echo "Finding or creating the agentlab-no-inbound security group..."
 SG_ID=$(aws ec2 describe-security-groups \
   --filters Name=group-name,Values=agentlab-no-inbound Name=vpc-id,Values="$VPC_ID" \
@@ -66,6 +88,7 @@ INSTANCE_ID=$(aws ec2 run-instances \
   --iam-instance-profile Name=agentlab-ec2-profile \
   --security-group-ids "$SG_ID" \
   --subnet-id "$SUBNET_ID" \
+  --associate-public-ip-address \
   --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":$VOLUME_SIZE,\"VolumeType\":\"gp3\"}}]" \
   --user-data "file://$SCRIPT_DIR/user-data.sh" \
   --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME_TAG}]" \
@@ -79,7 +102,9 @@ fi
 
 echo
 echo "Instance launched: $INSTANCE_ID"
-echo "No SSH key was used and no inbound ports are open — this instance is reachable only via SSM."
+echo "It has a public IP (needed to reach the internet for apt/Docker/GitHub and to register with"
+echo "SSM), but the security group still has zero inbound rules — nothing can connect to it from"
+echo "the internet on any port. No SSH key was used either; it's reachable only via SSM."
 echo
 echo "Watch the bootstrap (takes several minutes — Docker install, image pulls, kind cluster, the platform):"
 echo "  aws ssm start-session --target $INSTANCE_ID"
