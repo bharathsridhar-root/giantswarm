@@ -50,7 +50,7 @@ SG_ID=$(aws ec2 describe-security-groups \
 if [ -z "$SG_ID" ] || [ "$SG_ID" = "None" ]; then
   SG_ID=$(aws ec2 create-security-group \
     --group-name agentlab-no-inbound \
-    --description "agentlab demo — outbound only, reached via SSM" \
+    --description "agentlab demo - outbound only, reached via SSM" \
     --vpc-id "$VPC_ID" --query 'GroupId' --output text)
 fi
 if [ -z "$SG_ID" ] || [ "$SG_ID" = "None" ]; then
