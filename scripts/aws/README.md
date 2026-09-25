@@ -1,5 +1,11 @@
 # Running agentlab on EC2 with no SSH access
 
+**Picking this up after a break? Read `RUNBOOK.md` first** — it has the
+exact state of the last live instance, what's still unresolved, and every
+gotcha already hit and fixed (stale Go/kubectl, a chart bug, a full disk, a
+stale `session-manager-plugin`, SSO vs IAM-user credentials) so you don't
+re-discover any of it.
+
 For accounts where SSH (port 22 inbound) is blocked by policy. Everything
 here uses **AWS Systems Manager Session Manager** instead: the instance
 opens no inbound ports at all (outbound HTTPS only, to the SSM service),

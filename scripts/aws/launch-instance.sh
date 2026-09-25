@@ -9,7 +9,12 @@ INSTANCE_TYPE="${INSTANCE_TYPE:-m5.2xlarge}"  # 8 vCPU / 32 GiB — agentlab's 4
                                                # alongside it (see user-data.sh). m5.xlarge (4/16)
                                                # works if you skip the free model and bring your
                                                # own Anthropic key instead.
-VOLUME_SIZE="${VOLUME_SIZE:-30}"              # GiB; default 8GiB root disk is too small
+VOLUME_SIZE="${VOLUME_SIZE:-60}"               # GiB. 30 filled up in practice: a chart-version
+                                                # upgrade (see RUNBOOK.md) doubles many image
+                                                # pulls, plus Go toolchain + build cache + Ollama's
+                                                # model + platform images. 30 hit 100% full and took
+                                                # the control plane down with it (etcd is disk-
+                                                # sensitive); 60 leaves real headroom.
 NAME_TAG="${NAME_TAG:-agentlab-demo}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
