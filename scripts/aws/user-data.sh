@@ -100,6 +100,19 @@ go build -o agentlab .
 echo "Running agentlab configure --defaults (auto-detects the Ollama we just started)..."
 ./agentlab configure --defaults
 
+# The pinned default (config.DefaultChartVersion, baked into this build) can
+# be older than the machine running this script. 4.49.0 hits a known bug
+# (github.com/giantswarm/agent-platform/issues/649): signed charts like
+# cloudnative-pg 0.29.1 have two OCI layers (the chart + its PGP provenance
+# file) and the OCIRepository has no layerSelector, so source-controller
+# extracts layers[0] -- sometimes the provenance file -- and fails trying to
+# gunzip it ("requires gzip-compressed body: gzip: invalid header"), which
+# cascades into substrate/agent-manager/backstage/kagent/model-manager all
+# stuck on an unready dependency. Fixed in agent-platform v4.65.4 (PR #650).
+CHART_MIN_FIXED=4.65.4
+sed -i -E "s/^([[:space:]]*chartVersion:).*/\1 ${CHART_MIN_FIXED}/" agentlab.yaml
+grep chartVersion agentlab.yaml
+
 echo "Running agentlab up (creates the kind cluster, pulls several GiB of platform images)..."
 ./agentlab up --trust=false --open=false
 
