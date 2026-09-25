@@ -19,6 +19,13 @@ apt-get update -y
 apt-get install -y docker.io git awscli jq python3-yaml curl
 systemctl enable --now docker
 
+# agentlab embeds its own Kubernetes client and never installs kubectl
+# itself -- it's purely for a human to inspect the cluster with
+# (KUBECONFIG=/opt/agentlab/state/kubeconfig kubectl ...), so install it
+# explicitly for whoever connects over Session Manager to debug with.
+curl -Lo /usr/local/bin/kubectl "https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+chmod +x /usr/local/bin/kubectl
+
 # Ubuntu 22.04's apt-get golang-go is 1.18 — this repo's go.mod requires
 # 1.26.3. Install the real toolchain from upstream instead.
 GO_VERSION=1.26.3
