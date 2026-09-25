@@ -9,6 +9,11 @@ set -euxo pipefail
 exec > >(tee -a /var/log/agentlab-setup.log) 2>&1
 echo "=== agentlab bootstrap starting $(date -u) ==="
 
+# cloud-init runs user-data with a minimal environment - no $HOME, which
+# both `ollama` (panics without it: "$HOME is not defined") and Go's build
+# cache/module cache under $HOME/go need. We run as root throughout.
+export HOME=/root
+
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get install -y docker.io git awscli jq python3-yaml curl
