@@ -15,14 +15,24 @@ have to re-derive any of it from scratch.
 - **`./agentlab platform-test` passed clean, every check** — the platform
   itself is confirmed healthy end to end (Dex, muster, mcp-kubernetes, RBAC,
   Kyverno, kagent, Substrate, Prometheus, Backstage's metrics path).
-- **Open loose end**: viewing Backstage in an actual Mac browser never
-  worked tonight. See "Unresolved: browser access" below — pick this up
-  first tomorrow.
+- **Browser access resolved** (was the open loose end) — see "RESOLVED:
+  browser access to Backstage" below and `GETTING_STARTED.md` for the clean
+  procedure. Required a code change (`b3e7304`, kind port mappings now
+  bind `0.0.0.0`) plus `agentlab down && up` on the instance.
+- Logged in successfully as `admin@lab.local` via
+  `https://backstage.127.0.0.1.nip.io`, reached with: security-group rules
+  for 443 and 32000 scoped to the browser machine's IP, an `/etc/hosts`
+  entry pointing `*.127.0.0.1.nip.io` at the instance's public IP, and a
+  local `socat` proxy for port 32000 specifically (Dex's redirect is
+  hardcoded to literal `localhost`).
 
-**Cleanup owed** (uncommitted temporary changes, not in git — do these
-tomorrow regardless of how browser access gets fixed):
-- Security group `sg-0627cdd4c2eaf1b5f` has an inbound rule opening 443 to
-  `51.102.170.48/32` (the Mac's public IP at the time) —
+**Cleanup owed** (uncommitted temporary changes, not in git — revert once
+the demo session is done):
+- Security group `sg-0627cdd4c2eaf1b5f` has inbound rules for ports 443 and
+  32000 scoped to whatever the browser machine's IP was at the time (it
+  changed at least twice across this work — check current rules with
+  `aws ec2 describe-security-groups --group-ids sg-0627cdd4c2eaf1b5f` before
+  assuming which IP(s) are still allowed) —
   `aws ec2 revoke-security-group-ingress --group-id sg-0627cdd4c2eaf1b5f --protocol tcp --port 443 --cidr 51.102.170.48/32`
   once no longer needed (that IP may also have changed by tomorrow).
 - The Mac's `/etc/hosts` has a line pointing `backstage.127.0.0.1.nip.io` /
@@ -96,46 +106,44 @@ tomorrow regardless of how browser access gets fixed):
    `export-credentials` and re-paste whenever `aws sts get-caller-identity`
    starts failing with a credentials/token error.
 
-## Unresolved: browser access to Backstage
+## RESOLVED: browser access to Backstage
 
-Basic `aws ssm start-session --target <id>` (plain shell) works reliably
-after fix #7 above. **`--document-name AWS-StartPortForwardingSession`
-still fails** with `Plugin with name Port not found` even with the
-AWS-official plugin bundle installed and confirmed working for plain
-sessions. Not yet root-caused — candidates for tomorrow, in likely order:
+**The clean procedure is now `GETTING_STARTED.md` — follow that for a new
+setup.** Summary of what the real root causes turned out to be:
 
-1. **A Deloitte-side IAM/SCP restriction scoped to the port-forwarding SSM
-   document specifically** (allow-listing `AWS-StartSSHSession`/plain shell
-   but not `AWS-StartPortForwardingSession` is a common enterprise SSM
-   hardening pattern) — check the actual IAM policy attached to
-   `AWS_881490131520_Admin` for an `ssm:StartSession` condition on
-   `Resource: arn:aws:ssm:*:*:document/AWS-StartPortForwardingSession` or
-   similar, or ask Deloitte IT directly whether SSM port forwarding is
-   blocked by policy for this account.
-2. Try `AWS-StartSSHSession` + real OpenSSH `-L` forwarding instead (a
-   `ProxyCommand` tunneling actual SSH through SSM, no inbound port 22
-   needed) — it may hit the same underlying restriction as #1 since it's
-   plausibly the same stream-plugin family, but it's a different document
-   name and worth ruling out.
-3. The security-group + `/etc/hosts` workaround (open 443 to the Mac's own
-   IP, point `backstage.127.0.0.1.nip.io` at the instance's public IP so the
-   Host header/SNI still match) was set up tonight but the browser still
-   failed to connect. **Prime suspect: macOS DNS/browser caching** — an
-   `/etc/hosts` edit doesn't always take effect immediately.
-   Try, in order, before assuming the security group itself is the problem:
-   ```bash
-   sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder
-   ```
-   then a **hard-refresh** or a brand-new browser (private window), then
-   confirm resolution actually changed: `ping backstage.127.0.0.1.nip.io`
-   should show `63.179.117.4` (or whatever the current public IP is), not
-   `127.0.0.1`. If it still shows `127.0.0.1`, the `/etc/hosts` edit itself
-   didn't save/apply — re-check `cat /etc/hosts`.
-   Also double check the security group rule is actually on the right group
-   (confirm `i-0b2b592e56886ca70`'s current security groups match
-   `sg-0627cdd4c2eaf1b5f` exactly) and that the instance's public IP hasn't
-   changed since (EC2 instances lose their public IP if stopped/started,
-   though a running instance's shouldn't change).
+1. `aws ssm start-session --document-name AWS-StartPortForwardingSession`
+   never worked in this account/session (`Plugin with name Port not
+   found`, even with a correctly reinstalled official plugin and working
+   plain shell sessions) — never root-caused, possibly an org-level SSM
+   document restriction. **Abandoned in favor of a different mechanism**,
+   not fixed.
+2. The *real* blocker turned out to be upstream `agentlab` binding every
+   kind port mapping to `127.0.0.1` only (confirmed via `ss -tlnp` showing
+   `docker-proxy` on `127.0.0.1:443`, and an instant "connection refused"
+   from any external client — categorically different from a
+   security-group timeout). **Fixed in this fork**: changed
+   `internal/lab/templates/kind-config.yaml.tmpl` to bind `0.0.0.0`
+   instead (commit `b3e7304`). Requires `agentlab down && up` to take
+   effect on an already-running instance.
+3. With that fixed, a security-group rule scoped to one's own IP (for
+   ports 443 and 32000) plus a `/etc/hosts` entry pointing
+   `*.127.0.0.1.nip.io` at the instance's public IP got Backstage's own
+   page loading.
+4. Sign-in still failed one layer deeper: Dex's OAuth redirect is
+   hardcoded to the literal string `localhost` (not a `*.nip.io` name),
+   which `/etc/hosts` can't safely override system-wide. Fixed with a
+   local `socat TCP-LISTEN:32000,fork,reuseaddr TCP:<public-ip>:32000`
+   proxy on the client machine, so `localhost:32000` transparently reaches
+   the instance.
+5. One IP-address gotcha hit along the way: the security-group rule is
+   scoped to a specific `/32` and needs updating whenever the client's
+   public IP changes (it changed twice across this session) — always
+   re-check `curl -s https://checkip.amazonaws.com` on the actual browser
+   machine (not CloudShell, which has its own separate IP) before assuming
+   the network path is broken.
+6. Chrome specifically can fail where Firefox succeeds, due to Chrome's
+   "Secure DNS" (DoH) bypassing the `/etc/hosts` override — turn it off at
+   `chrome://settings/security` if hit.
 
 ## Free-model / no-Anthropic-key path (working, confirmed)
 
