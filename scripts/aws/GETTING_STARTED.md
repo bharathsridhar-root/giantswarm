@@ -127,10 +127,17 @@ literal string `localhost`, which is *your* machine, not the EC2 instance
 every other local tool that uses it, so a local proxy is the fix):
 ```bash
 brew install socat   # one-time
-socat TCP-LISTEN:32000,fork,reuseaddr TCP:<public-ip>:32000
+socat TCP-LISTEN:32000,bind=127.0.0.1,fork,reuseaddr TCP:<public-ip>:32000
 ```
+**The `bind=127.0.0.1` matters**: without it, `socat` listens on every
+network interface, not just loopback — anyone else on the same network as
+your machine (shared WiFi, hotel network) could then tunnel through your
+box to reach the EC2 instance's Dex port, bypassing the security-group IP
+restriction entirely (the outbound leg still comes from your machine's own
+trusted IP). Binding to loopback closes that off.
+
 Run this in its own terminal tab and **leave it running** for the whole
-session.
+session; stop it (Ctrl+C) when you're done.
 
 **5f. Verify before touching the browser**:
 ```bash
