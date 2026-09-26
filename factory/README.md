@@ -76,14 +76,29 @@ agent's declared toolset.
 
 ## Simulating machine telemetry
 
-The lab ships a minimal Prometheus but no factory data source. Easiest
-option: run a tiny synthetic exporter as a Deployment in-cluster that emits
-`factory_machine_temperature_celsius{machine="press-1"}` style gauges with
-random walk + occasional spikes, scraped by the lab's Prometheus. A ~40-line
-Python `prometheus_client` script in a `python:slim` pod is enough — ask
-Claude Code to scaffold one (`factory/simulator/`) once you've confirmed the
-agents are wired up; it's deliberately left out here so the first pass stays
-small enough to debug in Codespaces.
+`factory/simulator/` deploys a tiny synthetic exporter (a `python:3.12-slim`
+pod running `simulate.py`) that emits `factory_machine_temperature_celsius`,
+`factory_machine_vibration_index` and `factory_machine_throughput_units_per_min`
+for four machines (`press-1`, `press-2`, `cnc-1`, `conveyor-1`), each doing a
+random walk with an occasional multi-minute spike on a random machine — a
+demoable anomaly for `machine-monitor` to catch. A `ServiceMonitor` wires it
+into the lab's Prometheus automatically (its selectors are unrestricted, so
+any `ServiceMonitor` in any namespace gets picked up with no special labels
+needed).
+
+Deploy it, with `KUBECONFIG` pointed at the lab (`state/kubeconfig`):
+```bash
+./factory/simulator/apply.sh
+```
+
+Verify Prometheus sees it (through muster's `x_mcp-prometheus_execute_query`,
+or `agentlab open portal` → any PromQL surface):
+```
+factory_machine_temperature_celsius
+```
+should return four series. Then ask `machine-monitor` (via Backstage or
+A2A) something like "check the factory for anomalies" — during a spike
+window it should flag the affected machine and metric.
 
 ## Persisting work orders
 

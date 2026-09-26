@@ -1,0 +1,71 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: factory
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: factory-simulator
+  namespace: factory
+  labels:
+    app: factory-simulator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: factory-simulator
+  template:
+    metadata:
+      labels:
+        app: factory-simulator
+    spec:
+      containers:
+        - name: simulator
+          image: python:3.12-slim
+          command: ["sh", "-c", "pip install --no-cache-dir prometheus_client==0.21.1 && python /app/simulate.py"]
+          ports:
+            - name: metrics
+              containerPort: 9877
+          volumeMounts:
+            - name: script
+              mountPath: /app
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+      volumes:
+        - name: script
+          configMap:
+            name: factory-simulator
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: factory-simulator
+  namespace: factory
+  labels:
+    app: factory-simulator
+spec:
+  selector:
+    app: factory-simulator
+  ports:
+    - name: metrics
+      port: 9877
+      targetPort: metrics
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: factory-simulator
+  namespace: factory
+spec:
+  selector:
+    matchLabels:
+      app: factory-simulator
+  endpoints:
+    - port: metrics
+      interval: 15s
