@@ -32,19 +32,20 @@ def step(machine: str, now: float) -> None:
 
     spiking = now < spiking_until[machine]
 
-    # Random walk back toward baseline, wider swings while spiking.
-    drift = 8.0 if spiking else 1.5
-    s["temperature"] += random.uniform(-drift, drift * 1.5)
-    s["temperature"] = max(base["temperature"] - 10, s["temperature"])
+    # Mean-reverting walk (pulls back toward baseline every tick) with
+    # symmetric noise, wider while spiking, plus a hard clamp as a safety
+    # net -- an earlier asymmetric-noise version had no upper bound and
+    # drifted unboundedly upward over time regardless of spikes.
+    temp_target = base["temperature"] + (35 if spiking else 0)
+    s["temperature"] += (temp_target - s["temperature"]) * 0.15 + random.uniform(-2, 2)
+    s["temperature"] = min(120, max(base["temperature"] - 10, s["temperature"]))
 
-    vib_drift = 0.6 if spiking else 0.05
-    s["vibration"] += random.uniform(-vib_drift * 0.3, vib_drift)
-    s["vibration"] = max(0.5, s["vibration"])
+    vib_target = base["vibration"] + (1.8 if spiking else 0)
+    s["vibration"] += (vib_target - s["vibration"]) * 0.15 + random.uniform(-0.05, 0.05)
+    s["vibration"] = min(5.0, max(0.3, s["vibration"]))
 
-    if spiking:
-        s["throughput"] -= random.uniform(0, 3)
-    else:
-        s["throughput"] += random.uniform(-1, 1)
+    thr_target = base["throughput"] * (0.4 if spiking else 1.0)
+    s["throughput"] += (thr_target - s["throughput"]) * 0.15 + random.uniform(-1, 1)
     s["throughput"] = min(base["throughput"] * 1.1, max(0, s["throughput"]))
 
     temperature.labels(machine=machine).set(round(s["temperature"], 1))
