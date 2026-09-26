@@ -121,8 +121,23 @@ echo "Running agentlab up (creates the kind cluster, pulls several GiB of platfo
 # (docs/models.md "Local backends on the lab host"). Doing this before `up`
 # would just fall back to a guess.
 echo "Wiring the free local model as an extraModel (platform.extraModels: qwen35-2b)..."
-KIND_GATEWAY=$(docker network inspect kind -f '{{(index .IPAM.Config 0).Gateway}}')
-echo "  kind network gateway: $KIND_GATEWAY"
+# `index .IPAM.Config 0` grabs whichever IPAM block Docker lists first, and
+# on a dual-stack "kind" network that can be the IPv6 one -- an IPv6
+# literal needs brackets in a URL ("http://[::1]:11434"), so an unbracketed
+# one breaks Go's URL parser downstream (kagent fails to construct the
+# Ollama client: "invalid port ... after host"), and every agent using
+# this model fails its golden boot in an infinite retry loop with no
+# indication the model config itself is the cause. Filter for the IPv4
+# entry specifically instead of trusting array order.
+KIND_GATEWAY=$(docker network inspect kind | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for cfg in data[0]['IPAM']['Config']:
+    if ':' not in cfg['Gateway']:
+        print(cfg['Gateway'])
+        break
+")
+echo "  kind network IPv4 gateway: $KIND_GATEWAY"
 python3 - "$KIND_GATEWAY" <<'PYEOF'
 import sys, yaml
 
