@@ -150,5 +150,91 @@ setup.** Summary of what the real root causes turned out to be:
 `agentlab.yaml` has `platform.extraModels: [{name: qwen35-2b, provider:
 Ollama, model: qwen3.5:2b, baseUrl: http://<kind-gateway>:11434, think:
 false}]`. `factory/agents/*.yaml` already reference `modelConfig: qwen35-2b`.
-No Anthropic key was used or needed tonight — everything above is on the
-free path.
+No Anthropic key was used or needed across any of this — everything above
+is on the free path.
+
+## Session 3: agents created, one real gap found (pick up here)
+
+**All three factory agents exist in Backstage and are `Ready`**:
+`machine-monitor`, `maintenance-dispatcher`, `supervisor` (created via the
+UI wizard, not `agent-manager_create_agent` directly — the live prompts
+now differ from `factory/agents/*.yaml` on disk, see below).
+
+**Two real bugs found and fixed in the repo** (pull to get them on any
+fresh instance):
+- `qwen35-2b`'s `baseUrl` used whichever IPAM config entry Docker listed
+  first for the `kind` network, which was IPv6 this run
+  (`fc00:f853:ccd:e793::1`) — unbracketed in a URL, breaks Go's parser,
+  every agent using the model failed its "golden boot" in an infinite
+  retry loop. Fixed in `user-data.sh` to filter for the IPv4 entry
+  specifically (commit `54c59e0`). **On the live instance this still
+  needed a manual one-off fix** (re-patch `agentlab.yaml`'s `baseUrl` with
+  the correct IPv4 gateway, then `agentlab platform`) since the bug had
+  already written the bad value before the fix landed.
+- The factory simulator's random walk had a positive-bias asymmetric
+  noise term and no upper clamp — temperatures/vibration climbed
+  unboundedly (129-194°C observed after ~20 min), making every reading
+  "anomalous" with nothing normal to contrast against. Fixed with proper
+  mean-reversion + a hard clamp (commit `f3c1802`). Redeploy with
+  `./factory/simulator/apply.sh` after `git pull` if the live instance's
+  simulator predates this fix.
+
+**The free 2B model needs unusually explicit prompts and narrow toolsets**
+to work at all — three escalating rounds were needed for `machine-monitor`
+before it reliably worked:
+1. Named tool wrong (`promql_query` instead of `x_mcp-prometheus_execute_query`)
+2. Right tool, invented invalid PromQL wildcard syntax (`factories/*:factory_machine_*`)
+3. Fixed by (a) restricting its toolset from all 18 `mcp-prometheus` tools
+   down to just the one it needs, and (b) rewriting the prompt as an
+   explicit numbered script ("Call 1: query = <exact literal string>")
+   instead of prose describing what to do. The live prompt (in Backstage,
+   not yet copied back to `factory/agents/machine-monitor.yaml` — the
+   file still needs updating with this session's final working
+   version) is:
+   ```
+   You have exactly one tool: x_mcp-prometheus_execute_query. It takes one
+   argument, "query". You monitor 4 factory machines: press-1, press-2,
+   cnc-1, conveyor-1.
+
+   Call the tool 3 times, once for each of these exact strings as the
+   "query" argument. Copy them character for character. Never add "*",
+   never add "/", never combine them, never add a machine name to them:
+
+   Call 1: query = factory_machine_temperature_celsius
+   Call 2: query = factory_machine_vibration_index
+   Call 3: query = factory_machine_throughput_units_per_min
+   ...
+   ```
+   With this it correctly makes all 3 calls and produces a real answer —
+   but still takes 1-3 minutes and tens of thousands of tokens (no cost:
+   local model). `maintenance-dispatcher` and `supervisor` have **not**
+   been similarly hardened/tested yet — expect the same class of problem
+   the first time each is actually exercised.
+
+**Confirmed gap, not yet fixed: `supervisor` cannot delegate.** Asked
+"What is the current status of the factory?" with its toolset empty (`No
+tools`, as designed per `factory/agents/supervisor.yaml`), and it just
+asked a clarifying question in plain text — **no tool call appeared at
+all**. The assumption in `factory/README.md`/the agent prompts that an
+agent can reach another named agent "over A2A / muster" was never
+actually verified; it may require an explicit toolset entry (unclear
+which one — needs research into whether kagent/muster expose sibling
+agents as callable tools at all, and if so how to declare that in an
+`AgentTemplate`/Backstage's wizard) rather than working automatically
+with an empty toolset. **This is the next thing to solve** before the
+3-agent chain can work end to end.
+
+**Also delivered this session**: a 5-slide CIO-facing PPTX
+(`giant-swarm-agent-platform.pptx`, sent to the user, not committed to
+the repo) covering what the platform is, what was stood up, the smart
+factory pilot, and next steps — built with LibreOffice visual QA
+unavailable in that sandbox (confirmed broken on even a blank test file),
+so it only got schema/structural validation, not a pixel-level check.
+
+**Cleanup still owed** (temporary, not in git, same as before): security
+group rules for ports 443 and 32000 scoped to whatever the browser
+machine's IP was at the time, an `/etc/hosts` entry on that machine, and
+a `socat` process that needs to be running for port 32000 access — none
+of this persists automatically; expect to redo the browser-access steps
+in `GETTING_STARTED.md` section 5 next session if the IP has changed or
+the socat process was killed.
