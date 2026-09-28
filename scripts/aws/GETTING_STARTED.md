@@ -167,6 +167,91 @@ recheck `curl -s https://checkip.amazonaws.com` and re-run the
 `authorize-security-group-ingress` commands with the new IP (the old rule
 can be left in place or revoked with the equivalent `revoke-` command).
 
+## Resuming after a stop (do this every time you come back)
+
+Stopping the instance (see "Tearing down" below — `stop-instances`, not
+`terminate-instances`) keeps everything intact and free of charge, but a
+**new public IP** is assigned on every start, so the browser-access setup
+(security group rule, `/etc/hosts`, `socat`) needs redoing from scratch
+each time. The platform itself needs nothing redone — same disk, same
+cluster, same agents.
+
+```bash
+# 1. Start it (CloudShell)
+aws ec2 start-instances --instance-ids <instance-id>
+# wait ~30-60s, then get the new public IP:
+aws ec2 describe-instances --instance-ids <instance-id> \
+  --query 'Reservations[0].Instances[0].[State.Name,PublicIpAddress]' --output text
+
+# 2. Confirm the platform survived the reboot cleanly (Session Manager)
+aws ssm start-session --target <instance-id>
+sudo -i
+cd /opt/agentlab
+export KUBECONFIG=/opt/agentlab/state/kubeconfig
+./agentlab platform-test
+```
+
+A pod or two restarting once right after boot (racing Dex coming back up)
+is normal and self-heals within a minute or two — check
+`kubectl get pods -A | grep -v Running | grep -v Completed`; if restart
+counts aren't climbing and everything is `Running`, it's fine even if
+`platform-test` flags a historical restart count.
+
+Then redo browser access exactly as in step 5, with the **new** IP:
+```bash
+# get your current IP (on the browser machine, not CloudShell):
+curl -s https://checkip.amazonaws.com
+
+# CloudShell — open the security group for it:
+aws ec2 authorize-security-group-ingress --group-id <sg-id> --protocol tcp --port 443 --cidr <your-ip>/32
+aws ec2 authorize-security-group-ingress --group-id <sg-id> --protocol tcp --port 32000 --cidr <your-ip>/32
+
+# on the browser machine — update /etc/hosts with the NEW instance IP,
+# then start the tunnel with the NEW instance IP:
+socat TCP-LISTEN:32000,bind=127.0.0.1,fork,reuseaddr TCP:<new-instance-ip>:32000
+
+# verify before touching the browser:
+curl -v -k --max-time 10 https://backstage.127.0.0.1.nip.io 2>&1 | tail -10
+```
+
+### If the `curl` verify times out (not "connection refused")
+
+Work through these in order — a **timeout** (not an instant refusal)
+almost always means the security group, not the instance:
+
+1. **Wrong/stale IP** — the most common cause. Re-run
+   `checkip.amazonaws.com` on the *browser* machine specifically (not
+   CloudShell — they have different IPs), confirm the security-group rule
+   actually has that exact IP:
+   ```bash
+   aws ec2 describe-security-groups --group-ids <sg-id> \
+     --query 'SecurityGroupRules[?FromPort==`443` || FromPort==`32000`]'
+   ```
+2. **Confirm the instance side is actually fine** (Session Manager):
+   ```bash
+   ss -tlnp | grep -E ':443|:32000'   # should show docker-proxy on 0.0.0.0
+   docker ps                          # agentlab-control-plane should be Up
+   ```
+3. **Test from a completely different network path** to isolate client vs.
+   AWS-side: from CloudShell (unrestricted egress),
+   `curl -v -k --max-time 10 https://<instance-ip>:443` — a TLS error
+   (`unexpected eof`) here is actually **success** (it reached the server;
+   it just failed because a bare IP has no matching SNI) — what matters is
+   whether it *connects* instead of timing out.
+4. **If CloudShell connects fine but your machine still times out**:
+   confirmed — **a corporate network can silently block this specific
+   outbound connection** even though nothing about the AWS setup is wrong.
+   This actually happened during development on a Deloitte-managed
+   laptop/network: identical setup, correct security group, correct
+   listener — timed out on the corporate network, connected instantly over
+   a **phone hotspot**. If you hit this, tethering to a hotspot is the
+   fastest fix; getting it working on the corporate network would need
+   your IT team to allowlist outbound HTTPS to the instance's IP, which is
+   awkward since that IP changes on every stop/start.
+   Isolate it with a raw TCP test (no TLS, so it can't be a cert/SNI
+   issue): `nc -zv -G 5 <instance-ip> 443` — a bare timeout here, with
+   nothing else explaining it, points straight at network-level blocking.
+
 ## 7. Create the smart factory agents
 
 Once logged in, use Backstage's create-agent wizard (or script it through

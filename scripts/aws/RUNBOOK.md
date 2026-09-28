@@ -238,3 +238,32 @@ a `socat` process that needs to be running for port 32000 access — none
 of this persists automatically; expect to redo the browser-access steps
 in `GETTING_STARTED.md` section 5 next session if the IP has changed or
 the socat process was killed.
+
+## Session 4: stop/start cycle, and a real network finding
+
+Stopped and restarted the instance between sessions (`stop-instances` /
+`start-instances`, not `teardown.sh` — the disk, cluster and agents all
+survived intact, confirmed via `platform-test` passing after one
+self-healing pod restart from the Dex-readiness race on boot).
+
+**New instance IP after every start** (expected, no Elastic IP attached)
+meant redoing all of browser access — folded the full checklist into
+`GETTING_STARTED.md`'s new "Resuming after a stop" section so it's not
+re-derived from scratch again.
+
+**Real finding, not a config bug: the Deloitte corporate network blocks
+this connection outright.** Confirmed via elimination — the instance's
+`docker-proxy` was listening correctly on `0.0.0.0:443`, the security
+group had the exact right CIDR, `nc` (raw TCP, no TLS) to the instance
+timed out from the Deloitte network but connected instantly from a
+CloudShell test *and* from a phone hotspot. So: correct setup, verified
+reachable from the general internet, silently blocked specifically by
+that corporate network. Workaround: use a phone hotspot for browser
+access on this instance until/unless Deloitte IT allowlists outbound
+HTTPS to it (awkward regardless, since the IP changes every stop/start).
+This is now documented as the first thing to check in
+`GETTING_STARTED.md` if a `curl` verify times out.
+
+**`supervisor`'s delegation gap (from session 3) is still unsolved** —
+did not get to it this session, browser-access debugging took the whole
+session. Still the next thing to tackle once back in.
